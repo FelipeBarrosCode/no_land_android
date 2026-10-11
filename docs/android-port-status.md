@@ -2,9 +2,9 @@
 
 ## Current checkpoint
 
-The Android SDK/NDK scaffold and first native stream-shell layer are implemented. The Tauri Android project has been generated locally, the Rust library cross-checks for `aarch64-linux-android`, and the maintained Kotlin overlay compiles for the universal debug variant.
+The Android SDK/NDK scaffold and first native stream-shell layer are implemented. Separate ARM64 and x86_64 debug APKs build in CI. The x86_64 APK installs and launches on the API 36 `No_Land_API_36` emulator, loads the Rust library, and reaches the onboarding UI.
 
-This checkpoint does not claim working streaming or a device-tested APK. The Android activity, `SurfaceView`, and `MediaCodec` boundary exist, but Rust/JNI session delivery, Android VPN, secure storage, audio/input, and device validation remain incomplete.
+This checkpoint does not claim working streaming. The Android activity, `SurfaceView`, and `MediaCodec` boundary exist, but Rust/JNI session delivery, Android VPN, audio/input, and physical-device validation remain incomplete. See `docs/android-emulator-compatibility.md` for the full requirements matrix.
 
 ## Implemented
 
@@ -24,14 +24,17 @@ This checkpoint does not claim working streaming or a device-tested APK. The And
 - Maintained `src-tauri/android` overlay with a private full-screen `StreamActivity`, lifecycle-aware `StreamSurfaceView`, narrow JNI surface callbacks, and a surface-backed `MediaCodecVideoDecoder` access-unit API.
 - Android no longer enters desktop Tauri window, native-input, or performance-overlay branches during Rust compilation.
 - Local toolchain installed and verified: Android Studio Rabbit 1, API 36, Build Tools 36.0.0, NDK 29.0.14206865, CMake 3.22.1, four Rust Android targets, and Temurin JDK 21.
+- Android app secrets persist in an AES-256-GCM app-private vault and are scrubbed from `state.json`; hardware-backed Android Keystore wrapping remains future hardening.
+- GitHub Actions builds and uploads separate ARM64 and x86_64 debug APKs.
+- The x86_64 APK has been installed and cold-started on an API 36 emulator; WebView UI, Rust startup, network access, and encrypted state read-back were verified.
 
 ## Not implemented
 
 - Working native Android Moonlight streaming. The activity/surface/decoder shell exists, but Rust JNI exports, encoded packet delivery, decoder negotiation/recovery, audio output, microphone capture, and input/controller handling are not connected.
 - Android VPN/tunnel support, including a `VpnService` implementation, protected sockets, Direct/TURN transitions, and lifecycle reconciliation.
-- Android secure storage for application secrets, native clipboard/share/file-picker adapters, notifications, deep links, and other platform integrations.
+- Hardware-backed Android Keystore wrapping, native clipboard/share/file-picker adapters, complete notification permission handling, deep links, and other platform integrations.
 - Real Android Moonlight runtime replacement for the current link-safe shell ABI adapter. The adapter keeps startup/load safe and returns explicit invalid-state errors for unsupported streaming/input operations.
-- Release signing, CI builds, emulator tests, and physical-device acceptance.
+- Release signing, automated emulator/instrumentation CI, API-level runtime coverage, and physical-device acceptance.
 - A normal one-command Tauri APK build on this Windows machine until Developer Mode permits Tauri's generated-library symlink, or the build workflow gains a copy fallback.
 
 No Android runtime feature is considered complete because its shared frontend or Rust command already exists.
