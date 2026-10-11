@@ -1687,17 +1687,17 @@ mod tests {
 
         let mut transaction = RestoreTransaction::new(&plan, &roots, None);
         transaction.publish_to(RestoreTarget::Complete).unwrap();
-        let partial = destination_partial_path(
-            &home.join(".local/share/new/deep/interrupted.bin"),
-            plan.restore_id,
-        )
-        .unwrap();
+        let canonical_deep = fs::canonicalize(home.join(".local/share/new/deep")).unwrap();
+        let partial =
+            destination_partial_path(&canonical_deep.join("interrupted.bin"), plan.restore_id)
+                .unwrap();
         transaction.track_partial(&partial).unwrap();
         fs::write(&partial, b"incomplete").unwrap();
         let journal = journal::read(&plan.staging).unwrap();
         assert!(!journal.rollback_mappings.is_empty());
         assert!(!journal.prior_symlinks.is_empty());
-        assert!(journal.created_paths.contains(&created_path));
+        let canonical_created_path = fs::canonicalize(&created_path).unwrap();
+        assert!(journal.created_paths.contains(&canonical_created_path));
         assert!(journal
             .created_directories
             .iter()
