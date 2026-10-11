@@ -1,12 +1,33 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
+#[cfg(any(test, not(target_os = "android")))]
+use std::sync::Mutex;
+
 use async_trait::async_trait;
+#[cfg(not(target_os = "android"))]
 use keyring::Entry;
 use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest, Sha256};
+
+#[cfg(target_os = "android")]
+use {
+    aes_gcm::{
+        aead::{Aead, Payload},
+        Aes256Gcm, KeyInit, Nonce,
+    },
+    rand::{rngs::OsRng, RngCore},
+    std::{
+        fs::{self, OpenOptions},
+        io::Write,
+        path::{Path, PathBuf},
+    },
+};
+
+#[cfg(target_os = "android")]
+use crate::utils::atomic_file::write_atomically;
 
 use crate::{
     errors::{AppError, AppResult},
@@ -34,12 +55,14 @@ trait StateSecretBackend: Send + Sync {
     fn delete(&self, account: &str) -> AppResult<()>;
 }
 
+#[cfg(not(target_os = "android"))]
 struct KeyringStateSecrets {
     service: String,
     legacy_service: Option<String>,
     cache: Mutex<HashMap<String, Option<String>>>,
 }
 
+#[cfg(not(target_os = "android"))]
 impl KeyringStateSecrets {
     fn new(namespace: &str, migrate_unnamespaced: bool) -> Self {
         Self {
@@ -66,6 +89,7 @@ impl KeyringStateSecrets {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 impl StateSecretBackend for KeyringStateSecrets {
     fn get(&self, account: &str) -> AppResult<Option<String>> {
         if let Some(value) = self.cache_lock()?.get(account).cloned() {
@@ -165,17 +189,185 @@ impl StateSecretBackend for KeyringStateSecrets {
     }
 }
 
+#[cfg(target_os = "android")]
+struct AndroidPrivateStateSecrets {
+    root: PathBuf,
+    service: String,
+}
+
+#[cfg(target_os = "android")]
+impl AndroidPrivateStateSecrets {
+    const FORMAT_VERSION: u8 = 1;
+    const KEY_LENGTH: usize = 32;
+    const NONCE_LENGTH: usize = 12;
+
+    fn new(app_data_dir: &Path, namespace: &str) -> Self {
+        Self {
+            root: app_data_dir.join("secure-state-v1"),
+            service: format!("{SERVICE_PREFIX}.{namespace}"),
+        }
+    }
+
+    fn error(action: &str, error: impl std::fmt::Display) -> AppError {
+        AppError::SecureStorage(format!(
+            "Could not {action} Android protected state: {error}"
+        ))
+    }
+
+    fn set_owner_only(path: &Path) -> AppResult<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                .map_err(|error| Self::error("restrict access to", error))?;
+        }
+        Ok(())
+    }
+
+    fn master_key(&self) -> AppResult<[u8; Self::KEY_LENGTH]> {
+        fs::create_dir_all(&self.root)
+            .map_err(|error| Self::error("create secure storage", error))?;
+        let key_path = self.root.join("master.key");
+        if !key_path.exists() {
+            let mut key = [0_u8; Self::KEY_LENGTH];
+            OsRng.fill_bytes(&mut key);
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&key_path)
+            {
+                Ok(mut file) => {
+                    file.write_all(&key)
+                        .and_then(|()| file.sync_all())
+                        .map_err(|error| Self::error("initialize secure storage", error))?;
+                    Self::set_owner_only(&key_path)?;
+                    return Ok(key);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(Self::error("initialize secure storage", error)),
+            }
+        }
+
+        let bytes =
+            fs::read(&key_path).map_err(|error| Self::error("read secure storage key", error))?;
+        let key: [u8; Self::KEY_LENGTH] = bytes.try_into().map_err(|_| {
+            AppError::SecureStorage("Android secure storage key has an invalid length".to_string())
+        })?;
+        Self::set_owner_only(&key_path)?;
+        Ok(key)
+    }
+
+    fn account_path(&self, account: &str) -> PathBuf {
+        let digest = Sha256::digest(format!("{}\0{account}", self.service).as_bytes());
+        self.root.join(format!("{}.secret", hex::encode(digest)))
+    }
+
+    fn aad(&self, account: &str) -> Vec<u8> {
+        format!("{}\0{account}", self.service).into_bytes()
+    }
+}
+
+#[cfg(target_os = "android")]
+impl StateSecretBackend for AndroidPrivateStateSecrets {
+    fn get(&self, account: &str) -> AppResult<Option<String>> {
+        let path = self.account_path(account);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(Self::error("read protected state", error)),
+        };
+        if bytes.len() <= 1 + Self::NONCE_LENGTH || bytes[0] != Self::FORMAT_VERSION {
+            return Err(AppError::SecureStorage(
+                "Android protected state has an invalid format".to_string(),
+            ));
+        }
+
+        let key = self.master_key()?;
+        let cipher = Aes256Gcm::new_from_slice(&key)
+            .map_err(|error| Self::error("initialize protected state cipher", error))?;
+        let nonce = Nonce::from_slice(&bytes[1..1 + Self::NONCE_LENGTH]);
+        let plaintext = cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: &bytes[1 + Self::NONCE_LENGTH..],
+                    aad: &self.aad(account),
+                },
+            )
+            .map_err(|error| Self::error("decrypt protected state", error))?;
+        String::from_utf8(plaintext)
+            .map(Some)
+            .map_err(|error| Self::error("decode protected state", error))
+    }
+
+    fn put(&self, account: &str, value: &str) -> AppResult<()> {
+        if self.get(account)?.as_deref() == Some(value) {
+            return Ok(());
+        }
+
+        let key = self.master_key()?;
+        let cipher = Aes256Gcm::new_from_slice(&key)
+            .map_err(|error| Self::error("initialize protected state cipher", error))?;
+        let mut nonce_bytes = [0_u8; Self::NONCE_LENGTH];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: value.as_bytes(),
+                    aad: &self.aad(account),
+                },
+            )
+            .map_err(|error| Self::error("encrypt protected state", error))?;
+
+        let mut payload = Vec::with_capacity(1 + Self::NONCE_LENGTH + ciphertext.len());
+        payload.push(Self::FORMAT_VERSION);
+        payload.extend_from_slice(&nonce_bytes);
+        payload.extend_from_slice(&ciphertext);
+        let path = self.account_path(account);
+        write_atomically(&path, &payload)
+            .map_err(|error| Self::error("save protected state", error))?;
+        Self::set_owner_only(&path)?;
+
+        if self.get(account)?.as_deref() != Some(value) {
+            return Err(AppError::SecureStorage(
+                "Android protected state failed read-back verification".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn delete(&self, account: &str) -> AppResult<()> {
+        match fs::remove_file(self.account_path(account)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Self::error("remove protected state", error)),
+        }
+    }
+}
+
 pub struct KeychainBackedStateStore {
     inner: Arc<dyn StateStore>,
     secrets: Arc<dyn StateSecretBackend>,
 }
 
 impl KeychainBackedStateStore {
-    pub fn new(inner: Arc<dyn StateStore>, namespace: &str, migrate_unnamespaced: bool) -> Self {
-        Self {
-            inner,
-            secrets: Arc::new(KeyringStateSecrets::new(namespace, migrate_unnamespaced)),
-        }
+    pub fn new(
+        inner: Arc<dyn StateStore>,
+        namespace: &str,
+        migrate_unnamespaced: bool,
+        app_data_dir: &std::path::Path,
+    ) -> Self {
+        #[cfg(target_os = "android")]
+        let secrets: Arc<dyn StateSecretBackend> =
+            Arc::new(AndroidPrivateStateSecrets::new(app_data_dir, namespace));
+        #[cfg(not(target_os = "android"))]
+        let secrets: Arc<dyn StateSecretBackend> =
+            Arc::new(KeyringStateSecrets::new(namespace, migrate_unnamespaced));
+        #[cfg(target_os = "android")]
+        let _ = migrate_unnamespaced;
+
+        Self { inner, secrets }
     }
 
     #[cfg(test)]

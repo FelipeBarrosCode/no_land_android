@@ -93,6 +93,9 @@ noland-ssh = { path = "crates/noland-ssh" }
 rand-ssh = { package = "rand", version = "0.10" }
 zeroize = "1"
 
+[target.'cfg(target_os = "android")'.dependencies]
+aes-gcm = "0.10.3"
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
