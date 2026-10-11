@@ -32,7 +32,10 @@ mod package_manager;
 pub mod post_wireguard_setup;
 pub mod reboot_helper;
 pub mod remote_display;
-#[cfg_attr(target_os = "ios", path = "remote_exec_ios.rs")]
+#[cfg_attr(
+    any(target_os = "ios", target_os = "android"),
+    path = "remote_exec_ios.rs"
+)]
 pub mod remote_exec;
 pub mod shared_storage;
 #[cfg_attr(target_os = "ios", path = "sleep_inhibit_ios.rs")]

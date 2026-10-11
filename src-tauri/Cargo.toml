@@ -88,7 +88,7 @@ portable-pty = "0.9.0"
 tauri-plugin-process = "2.0.0"
 tauri-plugin-updater = "2.0.0"
 
-[target.'cfg(target_os = "ios")'.dependencies]
+[target.'cfg(any(target_os = "ios", target_os = "android"))'.dependencies]
 noland-ssh = { path = "crates/noland-ssh" }
 rand-ssh = { package = "rand", version = "0.10" }
 zeroize = "1"

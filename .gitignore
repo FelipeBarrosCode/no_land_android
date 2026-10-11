@@ -16,6 +16,18 @@ src-tauri/native/third_party/wireguard-apple/Sources/Shared/
 src-tauri/native/third_party/wireguard-apple/Sources/WireGuardApp/
 src-tauri/native/third_party/wireguard-apple/Sources/WireGuardNetworkExtension/
 
+# Android generated projects, build output, local SDK state, and release artifacts
+src-tauri/gen/android/
+src-tauri/android/.gradle/
+src-tauri/android/**/build/
+**/local.properties
+*.apk
+*.aab
+*.apks
+*.jks
+*.keystore
+key.properties
+
 # Packaging staging area recreated by prepare-mic-sidecar.mjs
 src-tauri/binaries/
 src-tauri/packaging/changelog

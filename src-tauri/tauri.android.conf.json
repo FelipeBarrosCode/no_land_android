@@ -1,0 +1,47 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Noland Connect",
+  "identifier": "com.noland.connect",
+  "build": {
+    "beforeDevCommand": "npm run dev -- --host 0.0.0.0",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Noland Connect",
+        "width": 390,
+        "height": 844
+      }
+    ],
+    "security": {
+      "capabilities": ["android"]
+    }
+  },
+  "bundle": {
+    "createUpdaterArtifacts": false,
+    "externalBin": [],
+    "resources": [
+      "../vm-cloud-mic-agent/Cargo.toml",
+      "../vm-cloud-mic-agent/src/**/*",
+      "../network-agent/Cargo.toml",
+      "../network-agent/Cargo.lock",
+      "../network-agent/src/**/*",
+      "../network-contracts/Cargo.toml",
+      "../network-contracts/Cargo.lock",
+      "../network-contracts/src/**/*",
+      "../state-agent/Cargo.toml",
+      "../state-agent/Cargo.lock",
+      "../state-agent/rust-toolchain.toml",
+      "../state-agent/crates/**/*",
+      "../state-agent/scripts/**/*",
+      "../state-agent/systemd/**/*"
+    ]
+  },
+  "plugins": {
+    "updater": null
+  }
+}

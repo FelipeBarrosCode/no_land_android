@@ -1,7 +1,11 @@
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
+#[cfg(not(target_os = "android"))]
+use tauri::Manager;
 
-use crate::moonlight::{domain::MoonlightConfiguration, runtime::RuntimeStatistics};
+use crate::moonlight::domain::MoonlightConfiguration;
+#[cfg(not(target_os = "android"))]
+use crate::moonlight::runtime::RuntimeStatistics;
 
 pub fn preference(
     configuration: &MoonlightConfiguration,
@@ -18,6 +22,7 @@ pub fn preference(
         .unwrap_or(global_default)
 }
 
+#[cfg(not(target_os = "android"))]
 fn number(value: Option<f64>) -> String {
     value
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -88,7 +93,7 @@ fn text(stats: &RuntimeStatistics, probe: Option<&serde_json::Value>) -> String 
     result
 }
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 fn text(stats: &RuntimeStatistics, probe: Option<&serde_json::Value>) -> String {
     let p = &stats.performance;
     let mut result = format!(
@@ -132,7 +137,11 @@ fn text(stats: &RuntimeStatistics, probe: Option<&serde_json::Value>) -> String 
     result
 }
 
+#[cfg(target_os = "android")]
+pub fn start(_app: AppHandle, _enabled: Arc<Mutex<Option<(String, bool)>>>) {}
+
 /// A single bounded updater for the native window, which has no React webview.
+#[cfg(not(target_os = "android"))]
 pub fn start(app: AppHandle, enabled: Arc<Mutex<Option<(String, bool)>>>) {
     tauri::async_runtime::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
@@ -206,10 +215,10 @@ fn clear_composited_text(app: &AppHandle) {
         .set_overlay_text(String::new());
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn clear_composited_text(_app: &AppHandle) {}
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn update(window: &tauri::Window, text: &str) {
     #[cfg(not(test))]
     {

@@ -1,20 +1,20 @@
 use std::path::{Path, PathBuf};
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 use std::process::{Command, Stdio};
 
 use tokio::fs;
 
 use crate::errors::{AppError, AppResult};
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 use crate::utils::{
     managed_binaries::configure_bundled_linux_runtime, process::configure_no_window,
 };
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 use super::os_detection::OsDetection;
 use super::vast_api::VastApiClient;
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 fn locate_ssh_key_tool(tool: &str) -> Option<PathBuf> {
     let os = OsDetection::new();
 
@@ -29,7 +29,7 @@ fn locate_ssh_key_tool(tool: &str) -> Option<PathBuf> {
     }
 }
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 fn resolve_ssh_key_tool(tool: &str) -> AppResult<PathBuf> {
     let os = OsDetection::new();
     locate_ssh_key_tool(tool).ok_or_else(|| {
@@ -58,7 +58,7 @@ impl SshKeyService {
         }
     }
 
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     pub async fn ensure_keypair(&self, root_dir: &Path) -> AppResult<SshKeyPaths> {
         let ssh_keygen_bin = resolve_ssh_key_tool("ssh-keygen")?;
 
@@ -134,11 +134,11 @@ impl SshKeyService {
         })
     }
 
-    #[cfg(target_os = "ios")]
+    #[cfg(any(target_os = "ios", target_os = "android"))]
     pub async fn ensure_keypair(&self, root_dir: &Path) -> AppResult<SshKeyPaths> {
         let directory = root_dir.join("keys");
         let name = self.key_name.clone();
-        tokio::task::spawn_blocking(move || ios::ensure_keypair(&directory, &name))
+        tokio::task::spawn_blocking(move || mobile::ensure_keypair(&directory, &name))
             .await
             .map_err(|error| AppError::Command(format!("SSH key task failed: {error}")))?
     }
@@ -151,8 +151,8 @@ impl SshKeyService {
             )));
         }
 
-        #[cfg(target_os = "ios")]
-        ios::load_private_key(key_path)?;
+        #[cfg(any(target_os = "ios", target_os = "android"))]
+        mobile::load_private_key(key_path)?;
         Ok(())
     }
 
@@ -185,7 +185,7 @@ impl SshKeyService {
     }
 }
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 async fn derive_public_key(ssh_keygen_bin: &Path, private_key_path: &Path) -> AppResult<String> {
     let ssh_keygen_bin = ssh_keygen_bin.to_path_buf();
     let private_key_path = private_key_path.to_path_buf();
@@ -272,32 +272,37 @@ fn normalize_key(key: &str) -> String {
         .join(" ")
 }
 
-#[cfg(target_os = "ios")]
-pub(crate) mod ios {
+#[cfg(any(target_os = "ios", target_os = "android"))]
+pub(crate) mod mobile {
     use super::*;
     use crate::utils::atomic_file::write_atomically;
     use noland_ssh::keys::{decode_secret_key, ssh_key::LineEnding, Algorithm, PrivateKey};
     use zeroize::Zeroizing;
 
-    const PREFIX: &str = "keychain:noland-ssh:";
+    #[cfg(target_os = "ios")]
+    const KEYCHAIN_PREFIX: &str = "keychain:noland-ssh:";
     static KEY_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn key_error(error: impl std::fmt::Display) -> AppError {
         AppError::State(format!("Could not access the protected SSH key: {error}"))
     }
 
-    fn entry(id: &str) -> AppResult<keyring::Entry> {
+    #[cfg(target_os = "ios")]
+    fn keychain_entry(id: &str) -> AppResult<keyring::Entry> {
         uuid::Uuid::parse_str(id).map_err(key_error)?;
         keyring::Entry::new("noland-connect.ssh", id).map_err(key_error)
     }
 
     pub fn load_private_key(path: &Path) -> AppResult<PrivateKey> {
         let content = Zeroizing::new(std::fs::read_to_string(path)?);
-        let material = if let Some(id) = content.trim().strip_prefix(PREFIX) {
-            Zeroizing::new(entry(id)?.get_password().map_err(key_error)?)
+        #[cfg(target_os = "ios")]
+        let material = if let Some(id) = content.trim().strip_prefix(KEYCHAIN_PREFIX) {
+            Zeroizing::new(keychain_entry(id)?.get_password().map_err(key_error)?)
         } else {
             content
         };
+        #[cfg(target_os = "android")]
+        let material = content;
         decode_secret_key(&material, None).map_err(key_error)
     }
 
@@ -327,12 +332,13 @@ pub(crate) mod ios {
                 PrivateKey::random(&mut rand_ssh::rng(), Algorithm::Ed25519).map_err(key_error)?
             }
         };
+        #[cfg(target_os = "ios")]
         if !existing
             .as_ref()
-            .is_some_and(|value| value.trim().starts_with(PREFIX))
+            .is_some_and(|value| value.trim().starts_with(KEYCHAIN_PREFIX))
         {
             let id = uuid::Uuid::new_v4().to_string();
-            let stored = entry(&id)?;
+            let stored = keychain_entry(&id)?;
             let material = key.to_openssh(LineEnding::LF).map_err(key_error)?;
             stored.set_password(&material).map_err(key_error)?;
             // Verify persistence before replacing a legacy private-key file.
@@ -342,10 +348,20 @@ pub(crate) mod ios {
             if decoded.public_key() != key.public_key() {
                 return Err(AppError::State("SSH Keychain verification failed".into()));
             }
-            write_atomically(&private_key_path, format!("{PREFIX}{id}\n").as_bytes())?;
+            write_atomically(
+                &private_key_path,
+                format!("{KEYCHAIN_PREFIX}{id}\n").as_bytes(),
+            )?;
         }
-        // Keep the existing path-based state contract; this file contains only
-        // an opaque Keychain reference, never the private key on iOS.
+        #[cfg(target_os = "android")]
+        if existing.is_none() {
+            let material = key.to_openssh(LineEnding::LF).map_err(key_error)?;
+            write_atomically(&private_key_path, material.as_bytes())?;
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&private_key_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        // Keep the existing path-based state contract. iOS stores an opaque
+        // Keychain reference, while Android stores the key in app-private data.
         let public = key.public_key().to_openssh().map_err(key_error)?;
         write_atomically(
             &public_key_path,

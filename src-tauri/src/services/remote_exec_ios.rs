@@ -1,4 +1,4 @@
-//! iOS adapter retaining the desktop command/event contract over in-process SSH.
+//! Mobile adapter retaining the desktop command/event contract over in-process SSH.
 use std::{
     collections::HashMap,
     future::Future,
@@ -128,7 +128,7 @@ impl RemoteExec {
     }
 
     fn connection(&self) -> AppResult<Connection> {
-        let key = super::ssh_keys::ios::load_private_key(Path::new(&self.private_key_path))?;
+        let key = super::ssh_keys::mobile::load_private_key(Path::new(&self.private_key_path))?;
         let known_hosts = Path::new(&self.private_key_path)
             .parent()
             .unwrap_or_else(|| Path::new("."))

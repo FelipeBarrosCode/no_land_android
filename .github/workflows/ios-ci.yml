@@ -1,9 +1,8 @@
 name: iOS CI
 
+# Kept for cross-platform regression checks, but Android is this fork's default lane.
 on:
-  pull_request:
-  push:
-    branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: ios-ci-${{ github.ref }}

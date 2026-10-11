@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 use arboard::Clipboard;
 
 use crate::errors::{AppError, AppResult};
@@ -54,7 +54,7 @@ enum RemotePlatform {
     Windows,
 }
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub fn read_local_text() -> AppResult<String> {
     let mut clipboard = Clipboard::new()
         .map_err(|error| AppError::Command(format!("Could not open local clipboard: {error}")))?;
@@ -67,7 +67,7 @@ pub fn read_local_text() -> AppResult<String> {
     Ok(content)
 }
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub fn write_local_text(content: &str) -> AppResult<()> {
     validate_text(content)?;
     let mut clipboard = Clipboard::new()
@@ -75,6 +75,21 @@ pub fn write_local_text(content: &str) -> AppResult<()> {
     clipboard
         .set_text(content.to_owned())
         .map_err(|error| AppError::Command(format!("Could not write local clipboard: {error}")))
+}
+
+#[cfg(target_os = "android")]
+pub fn read_local_text() -> AppResult<String> {
+    Err(AppError::Command(
+        "Android clipboard access requires the native Android bridge".to_string(),
+    ))
+}
+
+#[cfg(target_os = "android")]
+pub fn write_local_text(content: &str) -> AppResult<()> {
+    validate_text(content)?;
+    Err(AppError::Command(
+        "Android clipboard access requires the native Android bridge".to_string(),
+    ))
 }
 
 #[cfg(target_os = "ios")]

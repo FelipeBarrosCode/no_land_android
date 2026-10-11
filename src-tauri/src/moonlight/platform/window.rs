@@ -3,6 +3,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+#[cfg(not(target_os = "android"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 
 #[cfg(all(target_os = "macos", not(test)))]
@@ -15,9 +16,9 @@ use crate::moonlight::{
     domain::MoonlightError, native, platform::desktop_input::uninstall_native_stream_input,
 };
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub const STREAM_WINDOW_LABEL: &str = "moonlight-stream";
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "android"))]
 pub const STREAM_WINDOW_LABEL: &str = "main";
 
 #[cfg(target_os = "ios")]
@@ -79,7 +80,7 @@ impl NativeSurfaceDescriptor {
     }
 }
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub fn create_or_reuse_stream_window<R: Runtime>(
     app: &AppHandle<R>,
     width: u32,
@@ -115,7 +116,7 @@ pub fn create_or_reuse_stream_window<R: Runtime>(
     Ok(window)
 }
 
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "android"))]
 pub fn create_or_reuse_stream_window<R: Runtime>(
     app: &AppHandle<R>,
     _width: u32,
@@ -123,12 +124,20 @@ pub fn create_or_reuse_stream_window<R: Runtime>(
     _title: &str,
 ) -> Result<Window<R>, MoonlightError> {
     app.state::<StreamWindowCloseState>().reset();
-    app.get_window(STREAM_WINDOW_LABEL)
-        .ok_or_else(|| MoonlightError::Native("The iOS application window is unavailable".into()))
+    app.get_window(STREAM_WINDOW_LABEL).ok_or_else(|| {
+        MoonlightError::Native(format!(
+            "The {} application window is unavailable",
+            if cfg!(target_os = "android") {
+                "Android"
+            } else {
+                "iOS"
+            }
+        ))
+    })
 }
 
 pub fn present_stream_window<R: Runtime>(window: &Window<R>) -> Result<(), MoonlightError> {
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     {
         window
             .show()
@@ -149,6 +158,14 @@ pub fn present_stream_window<R: Runtime>(window: &Window<R>) -> Result<(), Moonl
             ));
         }
     }
+    #[cfg(target_os = "android")]
+    {
+        let _ = window;
+        Err(MoonlightError::Native(
+            "Android native stream presentation is not connected yet".into(),
+        ))
+    }
+    #[cfg(not(target_os = "android"))]
     Ok(())
 }
 
@@ -158,7 +175,7 @@ pub fn close_stream_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), Moonlig
         .finish_close_intercept();
     if let Some(window) = app.get_window(STREAM_WINDOW_LABEL) {
         let _ = uninstall_native_stream_input(&window);
-        #[cfg(not(target_os = "ios"))]
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
         window
             .close()
             .map_err(|error| MoonlightError::Native(error.to_string()))?;
@@ -170,6 +187,16 @@ pub fn close_stream_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), Moonlig
     Ok(())
 }
 
+#[cfg(target_os = "android")]
+pub fn stream_window_surface_descriptor<R: Runtime>(
+    _window: &Window<R>,
+) -> Result<NativeSurfaceDescriptor, MoonlightError> {
+    Err(MoonlightError::Native(
+        "Android stream surface bridge is not connected yet".into(),
+    ))
+}
+
+#[cfg(not(target_os = "android"))]
 pub fn stream_window_surface_descriptor<R: Runtime>(
     window: &Window<R>,
 ) -> Result<NativeSurfaceDescriptor, MoonlightError> {
@@ -197,6 +224,7 @@ pub fn stream_window_surface_descriptor<R: Runtime>(
     )
 }
 
+#[cfg(not(target_os = "android"))]
 fn surface_descriptor_from_raw_handles(
     raw_window: RawWindowHandle,
     raw_display: RawDisplayHandle,

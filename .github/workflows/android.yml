@@ -1,0 +1,110 @@
+name: Android CI and preview release
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags:
+      - "android-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/android-v') }}
+
+env:
+  JAVA_VERSION: "21"
+  NODE_VERSION: "22"
+  ANDROID_API_LEVEL: "36"
+  ANDROID_BUILD_TOOLS: "36.0.0"
+  ANDROID_NDK_VERSION: "29.0.14206865"
+  ANDROID_CMAKE_VERSION: "3.22.1"
+
+jobs:
+  build:
+    name: Build ARM64 debug APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK and NDK packages
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-${ANDROID_API_LEVEL}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}" \
+            "ndk;${ANDROID_NDK_VERSION}" \
+            "cmake;${ANDROID_CMAKE_VERSION}"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: android-arm64
+      - name: Install JavaScript dependencies
+        run: npm ci
+      - name: Validate Android source and shared frontend
+        run: |
+          npm run check:android
+          npm run i18n:check
+          npm run build
+          cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check
+      - name: Generate the Tauri Android project
+        run: npm run tauri:android:init
+      - name: Build ARM64 debug APK
+        run: npx tauri android build --debug --target aarch64 --config src-tauri/tauri.android.conf.json
+      - name: Stage APK and checksum
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          apk=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' | sort | head -n 1)
+          test -n "$apk"
+          cp "$apk" artifacts/no-land-android-arm64-debug.apk
+          sha256sum artifacts/no-land-android-arm64-debug.apk > artifacts/SHA256SUMS
+      - name: Upload Android preview artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: no-land-android-arm64-debug-${{ github.sha }}
+          path: artifacts
+          if-no-files-found: error
+          retention-days: 14
+
+  preview-release:
+    name: Publish tagged Android preview
+    if: startsWith(github.ref, 'refs/tags/android-v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download validated APK
+        uses: actions/download-artifact@v4
+        with:
+          name: no-land-android-arm64-debug-${{ github.sha }}
+          path: artifacts
+      - name: Publish GitHub preview release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: No Land Android ${{ github.ref_name }}
+          prerelease: true
+          generate_release_notes: true
+          files: |
+            artifacts/no-land-android-arm64-debug.apk
+            artifacts/SHA256SUMS

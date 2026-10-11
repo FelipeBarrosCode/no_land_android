@@ -1,8 +1,7 @@
 name: Nightly Release Rehearsal
 
+# Desktop release rehearsal is manual in the Android fork.
 on:
-  schedule:
-    - cron: "23 6 * * *"
   workflow_dispatch:
 
 permissions:

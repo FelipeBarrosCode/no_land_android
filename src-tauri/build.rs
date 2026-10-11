@@ -44,7 +44,12 @@ fn main() {
 
     let target = env::var("TARGET").expect("TARGET is not set");
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let is_android = target_os == "android";
     let is_ios = target_os == "ios";
+    let is_macos = target_os == "macos";
+    let is_linux = target_os == "linux";
+    let is_windows = target_os == "windows";
+    let is_desktop = is_macos || is_linux || is_windows;
 
     if is_ios {
         println!("cargo:rerun-if-changed=apple/NolandPlatform.m");
@@ -59,7 +64,17 @@ fn main() {
         println!("cargo:rustc-link-arg-cdylib=-Wl,-undefined,dynamic_lookup");
     }
 
-    if matches!(env::var("NOLAND_SKIP_NATIVE_BUILD").as_deref(), Ok("1")) {
+    if is_android {
+        println!("cargo:rerun-if-changed=native/android/noland_android_runtime_stub.c");
+        println!("cargo:rerun-if-changed=native/noland-moonlight/include/noland_moonlight.h");
+        cc::Build::new()
+            .file("native/android/noland_android_runtime_stub.c")
+            .include("native/noland-moonlight/include")
+            .flag_if_supported("-Wno-unused-parameter")
+            .compile("noland_android_runtime");
+    }
+
+    if is_android || matches!(env::var("NOLAND_SKIP_NATIVE_BUILD").as_deref(), Ok("1")) {
         if target.ends_with("apple-darwin") {
             cc::Build::new()
                 .file("src/moonlight/platform/macos_display_detect.m")
@@ -73,7 +88,7 @@ fn main() {
         return;
     }
 
-    if !is_ios {
+    if is_desktop {
         prepare_gstreamer_bundle(&target).expect("failed to prepare bundled GStreamer runtime");
         ensure_managed_sidecar_bundle_artifacts()
             .expect("failed to prepare managed tool sidecar bundle artifacts");
@@ -82,9 +97,6 @@ fn main() {
     let native_root = PathBuf::from("native");
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is not set"));
-    let is_macos = target.ends_with("apple-darwin");
-    let is_linux = target.contains("linux");
-    let is_windows = target.contains("windows");
     let wrapper_header = native_root.join("noland-moonlight/include/noland_moonlight.h");
 
     println!("cargo:rerun-if-changed=build.rs");
@@ -210,7 +222,10 @@ fn main() {
         "noland-moonlight/src/noland_microphone_ios.m",
         "noland-moonlight/src/noland_input_ios.c",
     ] {
-        println!("cargo:rerun-if-changed={}", native_root.join(source).display());
+        println!(
+            "cargo:rerun-if-changed={}",
+            native_root.join(source).display()
+        );
     }
 
     println!(
@@ -303,8 +318,14 @@ fn main() {
     );
     println!("cargo:rustc-link-search=native={}", enet_lib_dir.display());
     if is_ios {
-        println!("cargo:rustc-link-search=native={}", ios_opus_lib_dir.display());
-        println!("cargo:rustc-link-search=native={}", ios_mbedtls_lib_dir.display());
+        println!(
+            "cargo:rustc-link-search=native={}",
+            ios_opus_lib_dir.display()
+        );
+        println!(
+            "cargo:rustc-link-search=native={}",
+            ios_mbedtls_lib_dir.display()
+        );
     }
     if let Some(config) = windows_config {
         println!(

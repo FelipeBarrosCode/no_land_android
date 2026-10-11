@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import ts from "typescript";
 
-const root = resolve(new URL("..", import.meta.url).pathname);
+const root = fileURLToPath(new URL("../", import.meta.url));
 const localeDir = join(root, "src", "locales");
 const source = JSON.parse(readFileSync(join(localeDir, "en-US.json"), "utf8"));
 const sourceKeys = new Set(Object.keys(source));

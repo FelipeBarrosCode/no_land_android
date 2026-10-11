@@ -1349,8 +1349,9 @@ fn interface_mtu(interface: &str) -> Option<u32> {
     None
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "android"))]
 fn interface_mtu(_interface: &str) -> Option<u32> {
+    // Android MTU discovery will be supplied by the native network bridge.
     None
 }
 

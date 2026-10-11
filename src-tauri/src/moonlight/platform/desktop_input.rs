@@ -1,15 +1,17 @@
 #[cfg(target_os = "macos")]
 use std::ffi::c_void;
+#[cfg(not(target_os = "android"))]
+use std::sync::mpsc;
 use std::sync::{
     atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
-    mpsc, Arc, OnceLock, Weak,
+    Arc, OnceLock, Weak,
 };
 
 #[cfg(target_os = "macos")]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use tauri::{Runtime, Window};
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "android")))]
 use crate::moonlight::native;
 use crate::{
     input::{
@@ -161,7 +163,7 @@ pub fn install_native_stream_input<R: Runtime>(
         })?;
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "android")))]
     {
         run_on_window_main_thread(window, |window| {
             let surface = super::window::stream_window_surface_descriptor(window)?.to_native();
@@ -175,6 +177,14 @@ pub fn install_native_stream_input<R: Runtime>(
         })?;
     }
 
+    #[cfg(target_os = "android")]
+    {
+        let _ = window;
+        Err(MoonlightError::Native(
+            "Android native stream input is not connected yet".into(),
+        ))
+    }
+    #[cfg(not(target_os = "android"))]
     Ok(())
 }
 
@@ -188,10 +198,15 @@ pub fn uninstall_native_stream_input<R: Runtime>(window: &Window<R>) -> Result<(
         })?;
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "android")))]
     {
         let _ = window;
         unsafe { native::nl_desktop_input_uninstall() };
+    }
+
+    #[cfg(target_os = "android")]
+    {
+        let _ = window;
     }
 
     Ok(())
@@ -218,7 +233,7 @@ pub fn activate_native_stream_input<R: Runtime>(
         });
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "android")))]
     {
         let _ = window;
         let result =
@@ -230,6 +245,12 @@ pub fn activate_native_stream_input<R: Runtime>(
                 "failed to activate native desktop stream input capture: {other}"
             ))),
         }
+    }
+
+    #[cfg(target_os = "android")]
+    {
+        let _ = (window, mode);
+        Ok(false)
     }
 }
 
@@ -251,7 +272,7 @@ pub fn deactivate_native_stream_input<R: Runtime>(
         });
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "android")))]
     {
         let _ = window;
         let result = unsafe { native::nl_desktop_input_set_capture_active(false, 0) };
@@ -262,6 +283,12 @@ pub fn deactivate_native_stream_input<R: Runtime>(
                 "failed to deactivate native desktop stream input capture: {other}"
             ))),
         }
+    }
+
+    #[cfg(target_os = "android")]
+    {
+        let _ = window;
+        Ok(false)
     }
 }
 
@@ -294,6 +321,7 @@ fn native_capture_mode(mode: MouseMode) -> i32 {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn run_on_window_main_thread<R, T, F>(window: &Window<R>, f: F) -> Result<T, MoonlightError>
 where
     R: Runtime,
