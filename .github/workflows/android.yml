@@ -39,7 +39,6 @@ jobs:
         with:
           distribution: temurin
           java-version: ${{ env.JAVA_VERSION }}
-      - uses: android-actions/setup-android@v3
       - name: Install Android SDK and NDK packages
         shell: bash
         run: |
