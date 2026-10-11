@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 use crate::services::wireguard::{locate_noland_net_helper_binary, locate_wintun_library};
 use crate::{
     errors::{AppError, AppResult, FrontendError},
@@ -401,7 +401,39 @@ fn local_environment_check(_attempt_install: bool) -> LocalEnvironmentCheck {
         },
     ];
 
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(target_os = "android")]
+    let checks = vec![
+        ToolCheck {
+            tool: "native-ssh-sftp".to_string(),
+            found: true,
+            path: Some("in-process noland-ssh + russh-sftp".to_string()),
+            required_for: "remote commands, terminal sessions, provisioning, and uploads"
+                .to_string(),
+            install_hint: "This implementation is linked into the Android app and does not use local ssh or scp executables.".to_string(),
+            install_attempted: false,
+            install_error: None,
+        },
+        ToolCheck {
+            tool: "native-ssh-keygen".to_string(),
+            found: true,
+            path: Some("Rust Ed25519 + Android app-private storage".to_string()),
+            required_for: "SSH key generation and protected storage".to_string(),
+            install_hint: "This implementation is linked into the Android app and does not use ssh-keygen.".to_string(),
+            install_attempted: false,
+            install_error: None,
+        },
+        ToolCheck {
+            tool: "Android VpnService".to_string(),
+            found: false,
+            path: None,
+            required_for: "WireGuard Direct and Cloudflare TURN tunnel transports".to_string(),
+            install_hint: "Android VPN integration is not implemented in this preview build; no external package can provide it.".to_string(),
+            install_attempted: false,
+            install_error: None,
+        },
+    ];
+
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     let checks = {
         let bundled_check = |tool: &str, required_for: &str, resolved_path: Option<PathBuf>| {
             ToolCheck {
