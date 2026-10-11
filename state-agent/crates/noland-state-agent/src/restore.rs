@@ -5,7 +5,9 @@ use std::{
 };
 
 use noland_crypto::MasterKey;
-use noland_rclone_adapter::{EphemeralRcloneSession, TransferTuning};
+use noland_rclone_adapter::{
+    EphemeralRcloneSession, ProviderKind, TransferTuning, TransferWorkload,
+};
 use noland_restore::{
     prepare_restore, restore_pipelined, DownloadJournal, PipelineOptions, RestoreTarget,
 };
@@ -116,16 +118,25 @@ pub async fn run_restore_with_session(
     )?;
     let (config_path, _session_guard) =
         write_guarded_ephemeral_session(&agent.config.paths.run_root, session)?;
-    let gameplay_safe = !agent.db.open_session_app_ids()?.is_empty();
-    let tuning = if gameplay_safe {
-        TransferTuning::gameplay_safe()
+    let provider = ProviderKind::parse(&session.provider).unwrap_or(ProviderKind::Local);
+    let workload = if agent.db.open_session_app_ids()?.is_empty() {
+        TransferWorkload::Throughput
     } else {
-        TransferTuning::throughput()
+        TransferWorkload::GameplaySafe
     };
+    let tuning = TransferTuning::automatic(provider, workload);
+    tracing::info!(
+        provider = provider.as_str(),
+        ?workload,
+        uploads = tuning.max_parallel_uploads,
+        downloads = tuning.max_parallel_downloads,
+        rclone_transfers = tuning.rclone_transfers,
+        "resolved automatic shared-storage restore parallelism"
+    );
     let pipeline_options = PipelineOptions {
         // Streaming uses one ordered connection per pack, not copyto multistream.
         max_parallel_packs: tuning.max_parallel_downloads.max(1),
-        reconstruction_workers: if gameplay_safe {
+        reconstruction_workers: if workload == TransferWorkload::GameplaySafe {
             1
         } else {
             PipelineOptions::default().reconstruction_workers
