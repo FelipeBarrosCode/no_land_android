@@ -2794,11 +2794,8 @@ pub async fn get_rented_instances(
             instances
         }
         Err(error) => {
-            info!(
-                "get_rented_instances list failed; returning empty list for resilience: {}",
-                error
-            );
-            Vec::new()
+            warn!("get_rented_instances list failed: {}", error);
+            return Err(error.into());
         }
     };
 
