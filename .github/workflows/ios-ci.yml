@@ -23,7 +23,7 @@ jobs:
           cache: npm
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.23.x"
+          go-version: "1.26.x"
           cache-dependency-path: src-tauri/native/third_party/wireguard-apple/Sources/WireGuardKitGo/go.sum
       - uses: dtolnay/rust-toolchain@stable
         with:

@@ -8,7 +8,7 @@ use std::{
 
 use russh::{
     client,
-    keys::{known_hosts, PrivateKeyWithHashAlg, PublicKey},
+    keys::{known_hosts, PrivateKeyWithHashAlg, PublicKeyOrCertificate},
     Channel, ChannelMsg, Disconnect,
 };
 use russh_sftp::{
@@ -75,15 +75,19 @@ pub struct PinnedHost {
 impl client::Handler for PinnedHost {
     type Error = russh::Error;
 
-    async fn check_server_key(&mut self, key: &PublicKey) -> Result<bool, Self::Error> {
+    async fn check_server_key(
+        &mut self,
+        key_or_certificate: &PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
+        let key = key_or_certificate.public_key();
         // Serialize TOFU enrollment, including concurrent provisioning sessions.
         let _guard = HOST_KEY_GATE
             .lock()
             .map_err(|_| russh::Error::Inconsistent)?;
-        match known_hosts::check_known_hosts_path(&self.host, self.port, key, &self.path) {
+        match known_hosts::check_known_hosts_path(&self.host, self.port, &key, &self.path) {
             Ok(true) => Ok(true),
             Ok(false) => {
-                known_hosts::learn_known_hosts_path(&self.host, self.port, key, &self.path)?;
+                known_hosts::learn_known_hosts_path(&self.host, self.port, &key, &self.path)?;
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;

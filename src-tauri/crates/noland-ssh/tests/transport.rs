@@ -3,7 +3,7 @@ use noland_ssh::{
     Connection, Error, Message, TerminalText,
 };
 use russh::{
-    server::{self, Msg, Session},
+    server::{self, ChannelOpenHandle, Msg, Session},
     Channel, ChannelId, Pty,
 };
 use russh_sftp::protocol::{Attrs, FileAttributes, Handle, OpenFlags, Status, StatusCode, Version};
@@ -48,10 +48,12 @@ impl server::Handler for Handler {
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
         _: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         self.channels.insert(channel.id(), channel);
-        Ok(true)
+        reply.accept().await;
+        Ok(())
     }
     async fn exec_request(
         &mut self,

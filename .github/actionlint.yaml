@@ -3,6 +3,7 @@ self-hosted-runner:
   labels:
     - macos-15-intel
     - windows-11-arm
+    - macos-26
 
 config-variables:
   - NOLAND_ZAP_STAGING_URL
