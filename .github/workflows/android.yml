@@ -28,9 +28,19 @@ env:
 
 jobs:
   build:
-    name: Build ARM64 debug APK
+    name: Build ${{ matrix.abi }} debug APK
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64
+            rust_target: aarch64-linux-android
+            abi: arm64
+          - target: x86_64
+            rust_target: x86_64-linux-android
+            abi: x86_64
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -53,12 +63,12 @@ jobs:
             "cmake;${ANDROID_CMAKE_VERSION}"
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android
+          targets: ${{ matrix.rust_target }}
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-          key: android-arm64
+          key: android-${{ matrix.abi }}
       - name: Install JavaScript dependencies
         run: npm ci
       - name: Validate Android source and shared frontend
@@ -69,20 +79,20 @@ jobs:
           cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check
       - name: Generate the Tauri Android project
         run: npm run tauri:android:init
-      - name: Build ARM64 debug APK
-        run: npx tauri android build --debug --target aarch64 --config src-tauri/tauri.android.conf.json
+      - name: Build ${{ matrix.abi }} debug APK
+        run: npx tauri android build --debug --target ${{ matrix.target }} --config src-tauri/tauri.android.conf.json
       - name: Stage APK and checksum
         shell: bash
         run: |
           mkdir -p artifacts
           apk=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' | sort | head -n 1)
           test -n "$apk"
-          cp "$apk" artifacts/no-land-android-arm64-debug.apk
-          sha256sum artifacts/no-land-android-arm64-debug.apk > artifacts/SHA256SUMS
+          cp "$apk" "artifacts/no-land-android-${{ matrix.abi }}-debug.apk"
+          sha256sum "artifacts/no-land-android-${{ matrix.abi }}-debug.apk" > "artifacts/SHA256SUMS-${{ matrix.abi }}"
       - name: Upload Android preview artifact
         uses: actions/upload-artifact@v4
         with:
-          name: no-land-android-arm64-debug-${{ github.sha }}
+          name: no-land-android-${{ matrix.abi }}-debug-${{ github.sha }}
           path: artifacts
           if-no-files-found: error
           retention-days: 14
@@ -95,11 +105,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download validated APK
+      - name: Download validated APKs
         uses: actions/download-artifact@v4
         with:
-          name: no-land-android-arm64-debug-${{ github.sha }}
+          pattern: no-land-android-*-debug-${{ github.sha }}
           path: artifacts
+          merge-multiple: true
       - name: Publish GitHub preview release
         uses: softprops/action-gh-release@v2
         with:
@@ -108,4 +119,6 @@ jobs:
           generate_release_notes: true
           files: |
             artifacts/no-land-android-arm64-debug.apk
-            artifacts/SHA256SUMS
+            artifacts/no-land-android-x86_64-debug.apk
+            artifacts/SHA256SUMS-arm64
+            artifacts/SHA256SUMS-x86_64

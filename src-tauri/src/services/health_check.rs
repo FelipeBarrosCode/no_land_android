@@ -3,7 +3,7 @@ use std::{fs, path::Path, time::Duration};
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 use crate::services::wireguard::locate_noland_net_helper_binary;
 #[cfg(target_os = "ios")]
 use crate::services::{ios_platform::MicrophonePermission, ssh_keys::SshKeyService};
@@ -320,7 +320,51 @@ pub async fn run_system_health_report(app: &AppHandle, context: &AppContext) -> 
 
     probes.push(state_probe(&state));
 
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(target_os = "android")]
+    {
+        probes.push(ok_probe(
+            "binary.ssh",
+            "Native SSH client",
+            "native services",
+            "The in-process Rust SSH client is linked; no bundled executable is required on Android.",
+            Some("noland-ssh (russh transport)".to_string()),
+        ));
+        probes.push(ok_probe(
+            "binary.scp",
+            "Native SFTP upload client",
+            "native services",
+            "Recursive SFTP uploads are provided by the in-process SSH client; no SCP executable is required on Android.",
+            Some("noland-ssh (russh-sftp transport)".to_string()),
+        ));
+        probes.push(ok_probe(
+            "binary.ssh_keygen",
+            "Native SSH key generation",
+            "native services",
+            "SSH key generation is provided in process; no ssh-keygen executable is required on Android.",
+            None,
+        ));
+        probes.push(warn_probe(
+            "binary.net_helper",
+            "Android VPN tunnel",
+            "wireguard",
+            "Android VPN service integration is not complete in this preview build.",
+            None,
+            Some("Use this build for UI and emulator validation until the Android VPN service is implemented.".to_string()),
+        ));
+        probes.push(warn_probe(
+            "binary.mic_sender",
+            "Android microphone forwarding",
+            "audio",
+            "Android microphone forwarding is not complete in this preview build.",
+            None,
+            Some(
+                "Microphone forwarding requires the native Android audio implementation."
+                    .to_string(),
+            ),
+        ));
+    }
+
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     {
         let managed_ssh =
             os.locate_app_managed_binary("ssh", "NOLAND_SSH_BIN", cfg!(target_os = "windows"));

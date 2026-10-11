@@ -1116,12 +1116,10 @@ export const useAppStore = create<AppStore>((set, get) => {
     initialize: async () => {
       set({ loading: true, error: null });
       try {
-        const [appState, logs, postWireguardSetup, systemHealth, cloudflareTurnSettings] = await Promise.all([
+        const [appState, logs, postWireguardSetup] = await Promise.all([
           getAppState(),
           getProvisioningLogs(),
           getSetupStatus(),
-          runSystemHealthCheck().catch(() => null),
-          getCloudflareTurnSettings().catch(() => null),
         ]);
         let rentedInstances: RentedInstanceSummary[] = [];
         let vastWalletSummary: VastWalletSummary | null = null;
@@ -1146,11 +1144,16 @@ export const useAppStore = create<AppStore>((set, get) => {
           rentedInstances,
           sharedStorageProfiles: appState.sharedStorageProfiles ?? [],
           vastWalletSummary,
-          systemHealth,
-          cloudflareTurnSettings,
           provisioningModalDismissed: false,
           loading: false,
         });
+
+        void runSystemHealthCheck()
+          .then((systemHealth) => set({ systemHealth }))
+          .catch(() => undefined);
+        void getCloudflareTurnSettings()
+          .then((cloudflareTurnSettings) => set({ cloudflareTurnSettings }))
+          .catch(() => undefined);
       } catch (error) {
         const message = mapError(error);
         set({ loading: false, error: message });
