@@ -1,6 +1,11 @@
 import { existsSync, lstatSync, readFileSync, readdirSync } from "node:fs";
 import { basename, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  DESUGAR_DEPENDENCY,
+  injectWireGuardDependency,
+  WIREGUARD_DEPENDENCY,
+} from "./configure-android-project.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const failures = [];
@@ -168,8 +173,72 @@ check(
   "Configure script idempotently applies the optional maintained overlay",
 );
 check(
-  !/child_process|\bgradle\b|ANDROID_HOME|ANDROID_SDK_ROOT/u.test(configureScript),
+  !/child_process|ANDROID_HOME|ANDROID_SDK_ROOT/u.test(configureScript),
   "Configure script does not introduce an implicit SDK operation",
+);
+check(
+  configureScript.includes(WIREGUARD_DEPENDENCY) &&
+    configureScript.includes(DESUGAR_DEPENDENCY) &&
+    configureScript.includes("injectWireGuardDependency") &&
+    configureScript.includes('join(generated, "app", "build.gradle.kts")') &&
+    configureScript.includes('join(generated, "app", "build.gradle")'),
+  "Configure script targets either generated app Gradle dialect with pinned WireGuard and desugaring dependencies",
+);
+
+const kotlinGradleFixture = `plugins {\n  id("com.android.application")\n}\n\nandroid {\n  compileOptions {\n    sourceCompatibility = JavaVersion.VERSION_1_8\n    targetCompatibility = JavaVersion.VERSION_1_8\n    isCoreLibraryDesugaringEnabled = false\n  }\n  kotlinOptions {\n    jvmTarget = "1.8"\n  }\n}\n\ndependencies {\n  implementation("androidx.core:core-ktx:1.15.0")\n}\n`;
+const configuredKotlinGradle = injectWireGuardDependency(kotlinGradleFixture, "kotlin");
+check(
+  configuredKotlinGradle.includes('implementation("androidx.core:core-ktx:1.15.0")') &&
+    configuredKotlinGradle.includes(`implementation("${WIREGUARD_DEPENDENCY}")`) &&
+    configuredKotlinGradle.includes(`coreLibraryDesugaring("${DESUGAR_DEPENDENCY}")`) &&
+    configuredKotlinGradle.split(WIREGUARD_DEPENDENCY).length === 2 &&
+    configuredKotlinGradle.split(DESUGAR_DEPENDENCY).length === 2,
+  "Gradle injection preserves Kotlin DSL content and inserts one pinned WireGuard and desugaring dependency",
+);
+check(
+  configuredKotlinGradle.includes("sourceCompatibility = JavaVersion.VERSION_17") &&
+    configuredKotlinGradle.includes("targetCompatibility = JavaVersion.VERSION_17") &&
+    configuredKotlinGradle.includes("isCoreLibraryDesugaringEnabled = true") &&
+    configuredKotlinGradle.includes('jvmTarget = "17"') &&
+    !configuredKotlinGradle.includes("VERSION_1_8") &&
+    !configuredKotlinGradle.includes('jvmTarget = "1.8"') &&
+    !configuredKotlinGradle.includes("isCoreLibraryDesugaringEnabled = false"),
+  "Gradle injection enforces Java 17, Kotlin JVM 17, and Kotlin DSL core library desugaring",
+);
+check(
+  injectWireGuardDependency(configuredKotlinGradle, "kotlin") === configuredKotlinGradle,
+  "Kotlin Gradle compatibility injection is idempotent",
+);
+
+const groovyGradleFixture = `android {\n    compileOptions {\n        sourceCompatibility JavaVersion.VERSION_11\n        targetCompatibility JavaVersion.VERSION_11\n        coreLibraryDesugaringEnabled false\n    }\n    kotlinOptions {\n        jvmTarget = '11'\n    }\n}\n\ndependencies {\n    implementation 'com.wireguard.android:tunnel:1.0.20250531'\n    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.0.4'\n    implementation 'example:kept:1.0'\n}\n`;
+const configuredGroovyGradle = injectWireGuardDependency(groovyGradleFixture, "groovy");
+check(
+  !configuredGroovyGradle.includes("1.0.20250531") &&
+    !configuredGroovyGradle.includes("desugar_jdk_libs:2.0.4") &&
+    configuredGroovyGradle.includes(`implementation("${WIREGUARD_DEPENDENCY}")`) &&
+    configuredGroovyGradle.includes(`coreLibraryDesugaring("${DESUGAR_DEPENDENCY}")`) &&
+    configuredGroovyGradle.includes("implementation 'example:kept:1.0'"),
+  "Gradle injection upgrades stale Groovy dependency coordinates without replacing generated content",
+);
+check(
+  configuredGroovyGradle.includes("sourceCompatibility = JavaVersion.VERSION_17") &&
+    configuredGroovyGradle.includes("targetCompatibility = JavaVersion.VERSION_17") &&
+    configuredGroovyGradle.includes("coreLibraryDesugaringEnabled true") &&
+    configuredGroovyGradle.includes('jvmTarget = "17"') &&
+    !configuredGroovyGradle.includes("VERSION_11") &&
+    !configuredGroovyGradle.includes("coreLibraryDesugaringEnabled false") &&
+    injectWireGuardDependency(configuredGroovyGradle, "groovy") === configuredGroovyGradle,
+  "Groovy Gradle compatibility injection enforces Java/Kotlin 17 and is idempotent",
+);
+let missingAndroidBlockRejected = false;
+try {
+  injectWireGuardDependency('dependencies { implementation("example:kept:1.0") }\n');
+} catch {
+  missingAndroidBlockRejected = true;
+}
+check(
+  missingAndroidBlockRejected,
+  "Gradle compatibility injection fails clearly instead of blindly rewriting an unknown Android block shape",
 );
 
 const androidRuntimeStubPath = join(
@@ -219,6 +288,7 @@ const requiredOverlayFiles = [
   "app/src/main/java/com/noland/connect/stream/NativeStreamBridge.kt",
   "app/src/main/java/com/noland/connect/stream/StreamActivity.kt",
   "app/src/main/java/com/noland/connect/stream/StreamSurfaceView.kt",
+  "app/src/main/java/com/noland/connect/vpn/NolandVpnBridge.kt",
 ];
 for (const relativePath of requiredOverlayFiles) {
   check(existsSync(join(overlayRoot, relativePath)), `Android overlay provides ${relativePath}`);
@@ -230,6 +300,11 @@ check(
   manifest.includes('android:name=".stream.StreamActivity"') &&
     manifest.includes('android:exported="false"'),
   "Android stream activity is private to the application",
+);
+check(
+  manifest.includes('android:allowBackup="false"') &&
+    manifest.includes('android:fullBackupContent="false"'),
+  "Android manifest excludes private tunnel state from platform backups",
 );
 
 const decoderPath = join(
@@ -248,6 +323,83 @@ const decoder = existsSync(decoderPath) ? readFileSync(decoderPath, "utf8") : ""
 check(
   decoder.includes("MediaCodec.createDecoderByType") && decoder.includes("releaseOutputBuffer"),
   "Android stream overlay uses a surface-backed MediaCodec decoder",
+);
+
+const vpnBridgePath = join(
+  overlayRoot,
+  "app",
+  "src",
+  "main",
+  "java",
+  "com",
+  "noland",
+  "connect",
+  "vpn",
+  "NolandVpnBridge.kt",
+);
+const vpnBridge = existsSync(vpnBridgePath) ? readFileSync(vpnBridgePath, "utf8") : "";
+const vpnMethods = [
+  "installAndStart",
+  "reconnect",
+  "stop",
+  "remove",
+  "status",
+  "runtime",
+  "configuration",
+  "update",
+];
+check(
+  vpnBridge.includes("package com.noland.connect.vpn") &&
+    vpnBridge.includes("object NolandVpnBridge") &&
+    vpnMethods.every((method) =>
+      new RegExp(`@JvmStatic\\s+fun ${method}\\(context: Context, requestJson: String\\): String`, "u")
+        .test(vpnBridge),
+    ),
+  "Android VPN overlay exposes every required static Context/JSON bridge method",
+);
+check(
+  vpnBridge.includes("import androidx.annotation.Keep") &&
+    /@Keep\s+object NolandVpnBridge/u.test(vpnBridge),
+  "Android VPN bridge JNI class and static methods are retained in release builds",
+);
+check(
+  vpnBridge.includes("GoBackend") &&
+    vpnBridge.includes("Config.parse") &&
+    vpnBridge.includes(": Tunnel") &&
+    vpnBridge.includes('TUNNEL_NAME = "noland"'),
+  "Android VPN bridge uses the pinned tunnel library with one noland tunnel",
+);
+check(
+  vpnBridge.includes("VpnService.prepare(context)") &&
+    vpnBridge.includes("Intent.FLAG_ACTIVITY_NEW_TASK") &&
+    vpnBridge.includes('"permission_required"'),
+  "Android VPN bridge launches the system permission flow and reports permission_required",
+);
+check(
+  vpnBridge.includes("Context.MODE_PRIVATE") &&
+    ["configuration", "configuration_reference", "launch_id", "config_fingerprint"].every(
+      (key) => vpnBridge.includes(`"${key}"`),
+    ),
+  "Android VPN bridge durably stores configuration, reference, launch, and fingerprint in private preferences",
+);
+const runtimeFields = [
+  "ok",
+  "error",
+  "active",
+  "launchId",
+  "configFingerprint",
+  "peerPublicKey",
+  "endpoint",
+  "mtu",
+  "latestHandshakeAgeSecs",
+  "rxBytes",
+  "txBytes",
+];
+check(
+  runtimeFields.every((field) => vpnBridge.includes(`"${field}"`)) &&
+    vpnBridge.includes("getStatistics(NolandTunnel)") &&
+    vpnBridge.includes("latestHandshakeEpochMillis"),
+  "Android VPN runtime response uses camelCase native fields and GoBackend statistics",
 );
 
 const forbiddenArtifactNames = new Set(["key.properties", "local.properties"]);

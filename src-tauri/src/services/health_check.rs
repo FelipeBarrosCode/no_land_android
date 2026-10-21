@@ -343,13 +343,12 @@ pub async fn run_system_health_report(app: &AppHandle, context: &AppContext) -> 
             "SSH key generation is provided in process; no ssh-keygen executable is required on Android.",
             None,
         ));
-        probes.push(warn_probe(
+        probes.push(ok_probe(
             "binary.net_helper",
             "Android VPN tunnel",
             "wireguard",
-            "Android VPN service integration is not complete in this preview build.",
-            None,
-            Some("Use this build for UI and emulator validation until the Android VPN service is implemented.".to_string()),
+            "WireGuard is integrated through the app's Android VpnService bridge.",
+            Some("com.noland.connect.vpn.NolandVpnBridge".to_string()),
         ));
         probes.push(warn_probe(
             "binary.mic_sender",

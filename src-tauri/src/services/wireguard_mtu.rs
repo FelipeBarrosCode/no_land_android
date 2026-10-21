@@ -13,7 +13,7 @@ use crate::{
     moonlight::infrastructure::persistence::atomic_file::write_atomically,
 };
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 use super::wireguard::reconnect_local_wireguard_client;
 use super::{remote_exec::RemoteExec, wireguard::read_local_wireguard_configuration};
 #[cfg(not(target_os = "ios"))]
@@ -255,14 +255,14 @@ async fn apply_remote_mtu(remote: &RemoteExec, remote_interface: &str, mtu: u16)
 
 async fn apply_local_mtu(config_path: PathBuf, mtu: u16) -> AppResult<()> {
     tokio::task::spawn_blocking(move || {
-        #[cfg(target_os = "ios")]
+        #[cfg(any(target_os = "ios", target_os = "android"))]
         {
-            // The local file is an opaque reference after activation. The
-            // provider transaction updates WireGuardKit and shared Keychain,
-            // verifies read-back, and rolls back on persistence failure.
+            // Mobile tunnel updates must be committed through the native VPN
+            // backend so its persisted configuration and live runtime remain
+            // consistent with the Rust-side state.
             super::wireguard::set_managed_gotatun_mtu(&config_path, mtu, uuid::Uuid::new_v4())
         }
-        #[cfg(not(target_os = "ios"))]
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
         {
             write_local_config_mtu(&config_path, mtu)?;
             reconnect_local_wireguard_client(&config_path).map(|_| ())
@@ -272,7 +272,7 @@ async fn apply_local_mtu(config_path: PathBuf, mtu: u16) -> AppResult<()> {
     .map_err(|error| AppError::Command(format!("Local MTU update task failed: {error}")))?
 }
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 fn write_local_config_mtu(config_path: &Path, mtu: u16) -> AppResult<()> {
     let config = fs::read_to_string(config_path)?;
     let updated = replace_interface_mtu(&config, mtu).ok_or_else(|| {

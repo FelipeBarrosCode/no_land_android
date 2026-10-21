@@ -364,7 +364,7 @@ pub async fn verify_wireguard_connection(
     .await;
 
     let config_path = active_wireguard_config_path(context).await?;
-    #[cfg(target_os = "ios")]
+    #[cfg(any(target_os = "ios", target_os = "android"))]
     let result = {
         // WireGuardKit updates replace the peer, resetting handshake state.
         // Probe traffic first, then read the current handshake, and retry the
@@ -380,11 +380,11 @@ pub async fn verify_wireguard_connection(
             if result.reachable || tokio::time::Instant::now() >= deadline {
                 break result;
             }
-            info!(detail = ?result.error, "Waiting for iOS tunnel handshake and Sunshine reachability after configuration update");
+            info!(detail = ?result.error, "Waiting for mobile tunnel handshake and Sunshine reachability after configuration update");
             sleep(Duration::from_millis(500)).await;
         }
     };
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     let result = check_tunnel_reachability(&config_path);
 
     finish_wireguard_verification(app, context, result).await

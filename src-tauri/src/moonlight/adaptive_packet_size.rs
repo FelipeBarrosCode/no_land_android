@@ -1041,15 +1041,15 @@ struct ManagedTunnelStatus {
     error: Option<String>,
 }
 
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "android"))]
 fn detect_managed_tunnel(
     _app_data_dir: &Path,
     destination_ip: IpAddr,
 ) -> Option<ManagedTunnelInfo> {
     use crate::services::wireguard::{
-        active_ios_config_path, get_managed_gotatun_runtime, read_local_wireguard_configuration,
+        active_mobile_config_path, get_managed_gotatun_runtime, read_local_wireguard_configuration,
     };
-    let path = active_ios_config_path()?;
+    let path = active_mobile_config_path()?;
     let config = read_local_wireguard_configuration(&path).ok()?;
     let routes_match = config
         .lines()
@@ -1074,7 +1074,7 @@ fn detect_managed_tunnel(
     })
 }
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 fn detect_managed_tunnel(app_data_dir: &Path, destination_ip: IpAddr) -> Option<ManagedTunnelInfo> {
     detect_managed_tunnel_in_root(
         &platform_wireguard_root(app_data_dir),

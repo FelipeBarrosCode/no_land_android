@@ -1,3 +1,5 @@
+#[cfg(target_os = "android")]
+pub mod android_vpn;
 pub mod app_config;
 pub mod app_context;
 pub mod audio_latency;

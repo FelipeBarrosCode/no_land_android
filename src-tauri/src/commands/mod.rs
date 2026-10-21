@@ -424,10 +424,10 @@ fn local_environment_check(_attempt_install: bool) -> LocalEnvironmentCheck {
         },
         ToolCheck {
             tool: "Android VpnService".to_string(),
-            found: false,
-            path: None,
+            found: true,
+            path: Some("com.noland.connect.vpn.NolandVpnBridge".to_string()),
             required_for: "WireGuard Direct and Cloudflare TURN tunnel transports".to_string(),
-            install_hint: "Android VPN integration is not implemented in this preview build; no external package can provide it.".to_string(),
+            install_hint: "VpnService is integrated into the Android app; Android will request user approval before the first tunnel activation.".to_string(),
             install_attempted: false,
             install_error: None,
         },

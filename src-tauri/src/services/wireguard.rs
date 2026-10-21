@@ -170,12 +170,12 @@ const GOTATUN_HELPER_STOP_TIMEOUT_SECS: u64 = 15;
 #[cfg(target_os = "ios")]
 const IOS_WIREGUARD_REFERENCE_PREFIX: &str = "keychain:wireguard:";
 static ACTIVE_GOTATUN_STATUS_PATH: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
-#[cfg(target_os = "ios")]
-static ACTIVE_IOS_CONFIG_PATH: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+#[cfg(any(target_os = "ios", target_os = "android"))]
+static ACTIVE_MOBILE_CONFIG_PATH: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 
-#[cfg(target_os = "ios")]
-pub(crate) fn active_ios_config_path() -> Option<PathBuf> {
-    ACTIVE_IOS_CONFIG_PATH
+#[cfg(any(target_os = "ios", target_os = "android"))]
+pub(crate) fn active_mobile_config_path() -> Option<PathBuf> {
+    ACTIVE_MOBILE_CONFIG_PATH
         .get_or_init(|| Mutex::new(None))
         .lock()
         .ok()?
@@ -429,8 +429,8 @@ fn remember_active_gotatun_config(config_path: &Path) {
     if let Ok(mut path) = active_gotatun_status_path().lock() {
         *path = Some(gotatun_status_path(config_path));
     }
-    #[cfg(target_os = "ios")]
-    if let Ok(mut path) = ACTIVE_IOS_CONFIG_PATH
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    if let Ok(mut path) = ACTIVE_MOBILE_CONFIG_PATH
         .get_or_init(|| Mutex::new(None))
         .lock()
     {
@@ -457,7 +457,7 @@ fn load_active_gotatun_runtime_status() -> Option<GotatunRuntimeStatus> {
     load_gotatun_runtime_status(&path)
 }
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub fn set_managed_gotatun_peer_endpoint(
     config_path: &Path,
     endpoint: NetworkEndpoint,
@@ -492,6 +492,38 @@ pub fn set_managed_gotatun_peer_endpoint(
 }
 
 #[cfg(target_os = "ios")]
+fn update_mobile_vpn(
+    config_path: &Path,
+    configuration: &str,
+    expected: &str,
+    next: &str,
+    transition_id: uuid::Uuid,
+) -> AppResult<super::ios_vpn::Runtime> {
+    super::ios_vpn::update(config_path, configuration, expected, next, transition_id)
+}
+
+#[cfg(target_os = "android")]
+fn update_mobile_vpn(
+    config_path: &Path,
+    configuration: &str,
+    expected: &str,
+    next: &str,
+    transition_id: uuid::Uuid,
+) -> AppResult<super::android_vpn::Runtime> {
+    super::android_vpn::update(config_path, configuration, expected, next, transition_id)
+}
+
+#[cfg(target_os = "ios")]
+fn mobile_vpn_platform_name() -> &'static str {
+    "iOS"
+}
+
+#[cfg(target_os = "android")]
+fn mobile_vpn_platform_name() -> &'static str {
+    "Android"
+}
+
+#[cfg(any(target_os = "ios", target_os = "android"))]
 pub fn set_managed_gotatun_peer_endpoint(
     config_path: &Path,
     endpoint: NetworkEndpoint,
@@ -501,7 +533,11 @@ pub fn set_managed_gotatun_peer_endpoint(
         .validate()
         .map_err(|error| AppError::InvalidInput(error.to_string()))?;
     remember_active_gotatun_config(config_path);
+    #[cfg(target_os = "ios")]
     let protected = local_wireguard_is_protected(config_path)?;
+    #[cfg(target_os = "android")]
+    let protected = false;
+    let platform = mobile_vpn_platform_name();
     let current = read_local_wireguard_configuration(config_path)?;
     let previous = parse_wireguard_config_value(&current, "Peer", "Endpoint").ok_or_else(|| {
         AppError::State("Managed WireGuard configuration has no Peer Endpoint field".into())
@@ -515,11 +551,11 @@ pub fn set_managed_gotatun_peer_endpoint(
     if !protected {
         write_atomically(config_path, next.as_bytes()).map_err(|error| {
             AppError::Command(format!(
-                "Could not journal the iOS WireGuard endpoint configuration: {error}"
+                "Could not journal the {platform} WireGuard endpoint configuration: {error}"
             ))
         })?;
     }
-    let runtime = match super::ios_vpn::update(
+    let runtime = match update_mobile_vpn(
         config_path,
         &next,
         &expected_fingerprint,
@@ -530,16 +566,16 @@ pub fn set_managed_gotatun_peer_endpoint(
         Err(error) => {
             if !protected {
                 write_atomically(config_path, current.as_bytes()).map_err(|restore_error| {
-                AppError::State(format!(
-                    "iOS endpoint update failed ({error}); local journal rollback failed ({restore_error})"
-                ))
-            })?;
+                    AppError::State(format!(
+                        "{platform} endpoint update failed ({error}); local journal rollback failed ({restore_error})"
+                    ))
+                })?;
             }
             return Err(error);
         }
     };
     if runtime.endpoint != rendered || runtime.config_fingerprint != next_fingerprint {
-        let rollback = super::ios_vpn::update(
+        let rollback = update_mobile_vpn(
             config_path,
             &current,
             &next_fingerprint,
@@ -549,12 +585,12 @@ pub fn set_managed_gotatun_peer_endpoint(
         if !protected {
             write_atomically(config_path, current.as_bytes()).map_err(|error| {
                 AppError::State(format!(
-                    "iOS endpoint read-back failed and local rollback failed: {error}"
+                    "{platform} endpoint read-back failed and local rollback failed: {error}"
                 ))
             })?;
         }
         return Err(AppError::State(format!(
-            "iOS tunnel endpoint read-back mismatch: requested {rendered}, observed {}; runtime rollback: {}",
+            "{platform} tunnel endpoint read-back mismatch: requested {rendered}, observed {}; runtime rollback: {}",
             runtime.endpoint,
             rollback.map(|_| "ok".to_string()).unwrap_or_else(|error| error.to_string())
         )));
@@ -567,7 +603,7 @@ pub fn set_managed_gotatun_peer_endpoint(
     })
 }
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub fn set_managed_gotatun_mtu(
     config_path: &Path,
     mtu: u16,
@@ -598,7 +634,7 @@ pub fn set_managed_gotatun_mtu(
     Ok(())
 }
 
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "android"))]
 pub fn set_managed_gotatun_mtu(
     config_path: &Path,
     mtu: u16,
@@ -610,7 +646,11 @@ pub fn set_managed_gotatun_mtu(
         ));
     }
     remember_active_gotatun_config(config_path);
+    #[cfg(target_os = "ios")]
     let protected = local_wireguard_is_protected(config_path)?;
+    #[cfg(target_os = "android")]
+    let protected = false;
+    let platform = mobile_vpn_platform_name();
     let current = read_local_wireguard_configuration(config_path)?;
     let expected_fingerprint = format!("{:x}", Sha256::digest(current.as_bytes()));
     let next = replace_client_config_value(&current, "Interface", "MTU", &mtu.to_string())?;
@@ -618,11 +658,11 @@ pub fn set_managed_gotatun_mtu(
     if !protected {
         write_atomically(config_path, next.as_bytes()).map_err(|error| {
             AppError::Command(format!(
-                "Could not journal the iOS WireGuard MTU configuration: {error}"
+                "Could not journal the {platform} WireGuard MTU configuration: {error}"
             ))
         })?;
     }
-    let runtime = match super::ios_vpn::update(
+    let runtime = match update_mobile_vpn(
         config_path,
         &next,
         &expected_fingerprint,
@@ -633,16 +673,16 @@ pub fn set_managed_gotatun_mtu(
         Err(error) => {
             if !protected {
                 write_atomically(config_path, current.as_bytes()).map_err(|restore_error| {
-                AppError::State(format!(
-                    "iOS MTU update failed ({error}); local journal rollback failed ({restore_error})"
-                ))
-            })?;
+                    AppError::State(format!(
+                        "{platform} MTU update failed ({error}); local journal rollback failed ({restore_error})"
+                    ))
+                })?;
             }
             return Err(error);
         }
     };
     if runtime.mtu != mtu || runtime.config_fingerprint != next_fingerprint {
-        let rollback = super::ios_vpn::update(
+        let rollback = update_mobile_vpn(
             config_path,
             &current,
             &next_fingerprint,
@@ -652,12 +692,12 @@ pub fn set_managed_gotatun_mtu(
         if !protected {
             write_atomically(config_path, current.as_bytes()).map_err(|error| {
                 AppError::State(format!(
-                    "iOS MTU read-back failed and local rollback failed: {error}"
+                    "{platform} MTU read-back failed and local rollback failed: {error}"
                 ))
             })?;
         }
         return Err(AppError::State(format!(
-            "iOS tunnel MTU read-back mismatch: requested {mtu}, observed {}; runtime rollback: {}",
+            "{platform} tunnel MTU read-back mismatch: requested {mtu}, observed {}; runtime rollback: {}",
             runtime.mtu,
             rollback
                 .map(|_| "ok".to_string())
@@ -726,7 +766,7 @@ fn replace_client_config_value(
     Ok(output)
 }
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub fn get_managed_gotatun_runtime(config_path: &Path) -> AppResult<ManagedTunnelRuntime> {
     let status = require_active_gotatun_control(config_path)?;
     let launch_id = status.launch_id.parse::<uuid::Uuid>().map_err(|error| {
@@ -749,6 +789,23 @@ pub fn get_managed_gotatun_runtime(config_path: &Path) -> AppResult<ManagedTunne
 pub fn get_managed_gotatun_runtime(config_path: &Path) -> AppResult<ManagedTunnelRuntime> {
     remember_active_gotatun_config(config_path);
     let runtime = super::ios_vpn::runtime(config_path)?;
+    Ok(ManagedTunnelRuntime {
+        active: runtime.active,
+        launch_id: runtime.launch_id,
+        config_fingerprint: runtime.config_fingerprint,
+        peer_public_key: runtime.peer_public_key,
+        endpoint: runtime.endpoint,
+        mtu: runtime.mtu,
+        latest_handshake_age_secs: runtime.latest_handshake_age_secs,
+        rx_bytes: runtime.rx_bytes,
+        tx_bytes: runtime.tx_bytes,
+    })
+}
+
+#[cfg(target_os = "android")]
+pub fn get_managed_gotatun_runtime(config_path: &Path) -> AppResult<ManagedTunnelRuntime> {
+    remember_active_gotatun_config(config_path);
+    let runtime = super::android_vpn::runtime(config_path)?;
     Ok(ManagedTunnelRuntime {
         active: runtime.active,
         launch_id: runtime.launch_id,
@@ -1489,7 +1546,7 @@ fn teardown_managed_gotatun_tunnel(config_path: &Path) -> AppResult<String> {
     Ok("Embedded GotaTun tunnel stopped by Noland".to_string())
 }
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub fn verify_managed_gotatun_tunnel(config_path: &Path) -> AppResult<String> {
     remember_active_gotatun_config(config_path);
     let expected = load_expected_local_tunnel(config_path)?;
@@ -1597,6 +1654,47 @@ pub fn verify_managed_gotatun_tunnel(config_path: &Path) -> AppResult<String> {
     ))
 }
 
+#[cfg(target_os = "android")]
+pub fn verify_managed_gotatun_tunnel(config_path: &Path) -> AppResult<String> {
+    remember_active_gotatun_config(config_path);
+    let expected = load_expected_local_tunnel(config_path)?;
+    let expected_fingerprint = config_fingerprint(config_path)?;
+    let status = super::android_vpn::status(config_path)?;
+    if !status.ok || status.status != "connected" {
+        return Err(AppError::State(status.error.unwrap_or_else(|| {
+            format!("The Android VpnService tunnel is {}", status.status)
+        })));
+    }
+    let runtime = get_managed_gotatun_runtime(config_path)?;
+    let endpoint = format_endpoint(&NetworkEndpoint {
+        host: expected.endpoint_host.clone(),
+        port: expected.endpoint_port,
+    });
+    if !runtime.active
+        || runtime.config_fingerprint != expected_fingerprint
+        || runtime.peer_public_key != expected.peer_public_key
+        || runtime.endpoint != endpoint
+    {
+        return Err(AppError::State(format!(
+            "Android VpnService tunnel read-back mismatch (active={}, endpoint={}, expected_endpoint={endpoint})",
+            runtime.active, runtime.endpoint
+        )));
+    }
+    if !runtime
+        .latest_handshake_age_secs
+        .is_some_and(|age| age <= 180)
+    {
+        return Err(AppError::State(
+            "The Android VpnService tunnel has not completed a recent WireGuard handshake".into(),
+        ));
+    }
+    Ok(format!(
+        "Android VpnService is active with the exact current config (endpoint={}, handshake_age={}s)",
+        runtime.endpoint,
+        runtime.latest_handshake_age_secs.unwrap_or_default()
+    ))
+}
+
 fn wireguard_root_from_config_path(config_path: &Path) -> Option<PathBuf> {
     let parent = config_path.parent()?;
     if parent
@@ -1674,7 +1772,7 @@ impl WireGuardService {
         server_listen_port: u16,
         mode: WireGuardProvisionMode,
     ) -> AppResult<WireGuardProvisionResult> {
-        #[cfg(not(target_os = "ios"))]
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
         ensure_local_wireguard_tools()?;
 
         let local_config_path = instance_local_config_path(local_app_data_dir, instance_id);
@@ -2603,7 +2701,7 @@ pub fn setup_local_wireguard_client(config_path: &Path) -> AppResult<String> {
         )));
     }
 
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     ensure_local_wireguard_tools()?;
 
     normalize_wireguard_client_allowed_ips(config_path)?;
@@ -2619,7 +2717,7 @@ pub fn reconnect_local_wireguard_client(config_path: &Path) -> AppResult<String>
         )));
     }
 
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     ensure_local_wireguard_tools()?;
 
     normalize_wireguard_client_allowed_ips(config_path)?;
@@ -2628,7 +2726,7 @@ pub fn reconnect_local_wireguard_client(config_path: &Path) -> AppResult<String>
 }
 
 pub fn teardown_local_wireguard_client(config_path: &Path) -> AppResult<String> {
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     return teardown_managed_gotatun_tunnel(config_path);
     #[cfg(target_os = "ios")]
     {
@@ -2636,20 +2734,33 @@ pub fn teardown_local_wireguard_client(config_path: &Path) -> AppResult<String> 
         let status = super::ios_vpn::stop(config_path)?;
         Ok(format!("iOS managed tunnel stopped ({})", status.status))
     }
+    #[cfg(target_os = "android")]
+    {
+        remember_active_gotatun_config(config_path);
+        let status = super::android_vpn::stop(config_path)?;
+        Ok(format!(
+            "Android VpnService tunnel stopped ({})",
+            status.status
+        ))
+    }
 }
 
 fn setup_local_wireguard_client_inner(config_path: &Path) -> AppResult<String> {
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     return setup_managed_gotatun_tunnel(config_path);
     #[cfg(target_os = "ios")]
     return install_ios_wireguard_tunnel(config_path, "installed and activated");
+    #[cfg(target_os = "android")]
+    return install_android_wireguard_tunnel(config_path);
 }
 
 fn reconnect_local_wireguard_client_inner(config_path: &Path) -> AppResult<String> {
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     return reconnect_managed_gotatun_tunnel(config_path);
     #[cfg(target_os = "ios")]
     return install_ios_wireguard_tunnel(config_path, "reconnected");
+    #[cfg(target_os = "android")]
+    return reconnect_android_wireguard_tunnel(config_path);
 }
 
 #[cfg(target_os = "ios")]
@@ -2671,11 +2782,47 @@ fn install_ios_wireguard_tunnel(config_path: &Path, action: &str) -> AppResult<S
     Ok(format!("iOS Network Extension tunnel {action} by Noland"))
 }
 
+#[cfg(target_os = "android")]
+fn install_android_wireguard_tunnel(config_path: &Path) -> AppResult<String> {
+    remember_active_gotatun_config(config_path);
+    let configuration = read_local_wireguard_configuration(config_path)?;
+    let expected = load_expected_local_tunnel(config_path)?;
+    let fingerprint = format!("{:x}", Sha256::digest(configuration.as_bytes()));
+    let launch_id = uuid::Uuid::new_v4().to_string();
+    let status =
+        super::android_vpn::install(config_path, &configuration, &launch_id, &fingerprint)?;
+    if status.status != "connected" {
+        return Err(AppError::State(format!(
+            "Android VpnService tunnel did not connect after installation: {}",
+            status.status
+        )));
+    }
+    wait_for_local_tunnel_health(&expected, Duration::from_secs(120), Duration::from_secs(2))?;
+    Ok("Android VpnService tunnel installed and activated by Noland".into())
+}
+
+#[cfg(target_os = "android")]
+fn reconnect_android_wireguard_tunnel(config_path: &Path) -> AppResult<String> {
+    remember_active_gotatun_config(config_path);
+    let expected = load_expected_local_tunnel(config_path)?;
+    let status = super::android_vpn::reconnect(config_path)?;
+    if status.status != "connected" {
+        return Err(AppError::State(format!(
+            "Android VpnService tunnel did not reconnect: {}",
+            status.status
+        )));
+    }
+    wait_for_local_tunnel_health(&expected, Duration::from_secs(120), Duration::from_secs(2))?;
+    Ok("Android VpnService tunnel reconnected by Noland".into())
+}
+
 pub fn remove_local_wireguard_config(config_path: &Path) -> AppResult<()> {
     #[cfg(target_os = "ios")]
     if config_path.exists() {
         super::ios_vpn::remove(config_path)?;
     }
+    #[cfg(target_os = "android")]
+    super::android_vpn::remove(config_path)?;
     let Some(parent) = config_path.parent() else {
         return Ok(());
     };
@@ -2720,7 +2867,7 @@ pub fn remove_local_wireguard_config(config_path: &Path) -> AppResult<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub fn read_local_wireguard_show_output() -> AppResult<String> {
     let Some(status) = load_active_gotatun_runtime_status() else {
         return Ok(String::new());
@@ -2749,7 +2896,7 @@ pub fn read_local_wireguard_show_output() -> AppResult<String> {
 
 #[cfg(target_os = "ios")]
 pub fn read_local_wireguard_show_output() -> AppResult<String> {
-    let config_path = ACTIVE_IOS_CONFIG_PATH
+    let config_path = ACTIVE_MOBILE_CONFIG_PATH
         .get_or_init(|| Mutex::new(None))
         .lock()
         .map_err(|_| AppError::State("iOS tunnel path lock was poisoned".into()))?
@@ -2769,6 +2916,37 @@ pub fn read_local_wireguard_show_output() -> AppResult<String> {
         .unwrap_or_else(|| "never".into());
     Ok(format!(
         "interface: noland-ios\n  public key: managed-by-wireguardkit\n  peer: {}\n    endpoint: {}\n    allowed ips: {}\n    latest handshake: {}\n    transfer: {} B received, {} B sent\n",
+        runtime.peer_public_key,
+        runtime.endpoint,
+        expected.allowed_ips,
+        handshake,
+        runtime.rx_bytes,
+        runtime.tx_bytes,
+    ))
+}
+
+#[cfg(target_os = "android")]
+pub fn read_local_wireguard_show_output() -> AppResult<String> {
+    let config_path = ACTIVE_MOBILE_CONFIG_PATH
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .map_err(|_| AppError::State("Android tunnel path lock was poisoned".into()))?
+        .clone();
+    let Some(config_path) = config_path else {
+        return Ok(String::new());
+    };
+    let runtime = match get_managed_gotatun_runtime(&config_path) {
+        Ok(runtime) if runtime.active => runtime,
+        Ok(_) => return Ok(String::new()),
+        Err(error) => return Err(error),
+    };
+    let expected = load_expected_local_tunnel(&config_path)?;
+    let handshake = runtime
+        .latest_handshake_age_secs
+        .map(|age| format!("{age} seconds ago"))
+        .unwrap_or_else(|| "never".into());
+    Ok(format!(
+        "interface: noland-android\n  public key: managed-by-vpnservice\n  peer: {}\n    endpoint: {}\n    allowed ips: {}\n    latest handshake: {}\n    transfer: {} B received, {} B sent\n",
         runtime.peer_public_key,
         runtime.endpoint,
         expected.allowed_ips,
