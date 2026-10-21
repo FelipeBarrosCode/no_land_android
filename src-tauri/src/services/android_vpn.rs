@@ -96,7 +96,8 @@ fn java_exception_message(env: &mut JNIEnv<'_>) -> Option<String> {
         return None;
     }
     let rendered = JString::from(rendered);
-    Some(env.get_string(&rendered).ok()?.into())
+    let message: String = env.get_string(&rendered).ok()?.into();
+    Some(message)
 }
 
 fn jni_failure(env: &mut JNIEnv<'_>, method: &str, error: jni::errors::Error) -> AppError {
