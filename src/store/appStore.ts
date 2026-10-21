@@ -420,6 +420,26 @@ async function enrichRentedInstancesWithEmbeddedStatus(
   );
 }
 
+async function withFallbackTimeout<T>(
+  promise: Promise<T>,
+  fallback: T,
+  timeoutMs = 5_000,
+): Promise<T> {
+  let timeoutId: number | undefined;
+  try {
+    return await Promise.race([
+      promise.catch(() => fallback),
+      new Promise<T>((resolve) => {
+        timeoutId = window.setTimeout(() => resolve(fallback), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeoutId !== undefined) {
+      window.clearTimeout(timeoutId);
+    }
+  }
+}
+
 function mapError(error: unknown): string {
   if (typeof error === "string") {
     return error;
@@ -1116,10 +1136,10 @@ export const useAppStore = create<AppStore>((set, get) => {
     initialize: async () => {
       set({ loading: true, error: null });
       try {
-        const [appState, logs, postWireguardSetup] = await Promise.all([
-          getAppState(),
-          getProvisioningLogs(),
-          getSetupStatus(),
+        const appState = await getAppState();
+        const [logs, postWireguardSetup] = await Promise.all([
+          withFallbackTimeout(getProvisioningLogs(), []),
+          withFallbackTimeout(getSetupStatus(), appState.postWireguardSetup),
         ]);
         let rentedInstances: RentedInstanceSummary[] = [];
         let vastWalletSummary: VastWalletSummary | null = null;
