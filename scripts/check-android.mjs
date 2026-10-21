@@ -35,6 +35,11 @@ const configureScript = existsSync(configureScriptPath)
   ? readFileSync(configureScriptPath, "utf8")
   : "";
 const gitignore = readFileSync(join(root, ".gitignore"), "utf8");
+const tauriBuildScript = readFileSync(join(root, "src-tauri", "build.rs"), "utf8");
+const stateAgentRuntime = readFileSync(
+  join(root, "src-tauri", "src", "services", "shared_storage", "agent_runtime.rs"),
+  "utf8",
+);
 const ignoreLines = new Set(
   gitignore
     .split(/\r?\n/u)
@@ -120,6 +125,17 @@ check(
     resources.length === expectedResources.length &&
     expectedResources.every((resource) => resources.includes(resource)),
   "Android config preserves the shared remote-agent resources",
+);
+
+check(
+  tauriBuildScript.includes("embed_android_state_agent_source") &&
+    tauriBuildScript.includes('append_dir_all("state-agent", &source_dir)'),
+  "Android build embeds the state-agent source archive",
+);
+check(
+  stateAgentRuntime.includes("EMBEDDED_STATE_AGENT_SOURCE") &&
+    stateAgentRuntime.includes("materialize_embedded_state_agent_source"),
+  "Android runtime materializes the embedded state-agent source archive",
 );
 
 if (Array.isArray(resources)) {

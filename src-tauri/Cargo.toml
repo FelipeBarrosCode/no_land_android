@@ -24,7 +24,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 bindgen = "0.70.1"
 cc = "1.1.31"
 cmake = "0.1.51"
+flate2 = "1"
 sha2 = "0.10.9"
+tar = "0.4"
 tauri-build = { version = "2.0.0", features = [] }
 
 [dependencies]

@@ -51,6 +51,10 @@ fn main() {
     let is_windows = target_os == "windows";
     let is_desktop = is_macos || is_linux || is_windows;
 
+    if is_android {
+        embed_android_state_agent_source();
+    }
+
     if is_ios {
         println!("cargo:rerun-if-changed=apple/NolandPlatform.m");
         cc::Build::new()
@@ -448,6 +452,38 @@ fn main() {
     write_static_noland_moonlight_bindings();
 
     tauri_build::build()
+}
+
+fn embed_android_state_agent_source() {
+    let manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is not set"));
+    let source_dir = manifest_dir.join("../state-agent");
+    let output = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is not set"))
+        .join("state-agent-source.tar.gz");
+
+    for path in [
+        "../state-agent/Cargo.toml",
+        "../state-agent/Cargo.lock",
+        "../state-agent/rust-toolchain.toml",
+        "../state-agent/crates",
+        "../state-agent/scripts",
+        "../state-agent/systemd",
+    ] {
+        println!("cargo:rerun-if-changed={path}");
+    }
+
+    let archive_file =
+        fs::File::create(&output).expect("failed to create embedded state-agent archive");
+    let encoder = flate2::write::GzEncoder::new(archive_file, flate2::Compression::best());
+    let mut archive = tar::Builder::new(encoder);
+    archive
+        .append_dir_all("state-agent", &source_dir)
+        .expect("failed to archive state-agent source tree");
+    archive
+        .into_inner()
+        .expect("failed to finish state-agent tar archive")
+        .finish()
+        .expect("failed to finish state-agent gzip archive");
 }
 
 fn write_static_noland_moonlight_bindings() {

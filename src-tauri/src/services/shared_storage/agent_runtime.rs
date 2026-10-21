@@ -3,6 +3,10 @@
 use std::env;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+
+#[cfg(target_os = "android")]
+const EMBEDDED_STATE_AGENT_SOURCE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/state-agent-source.tar.gz"));
 use std::time::Duration;
 
 use crate::errors::{AppError, AppResult};
@@ -102,6 +106,11 @@ fn find_state_agent_source_dir() -> AppResult<PathBuf> {
         return Ok(workspace_candidate);
     }
 
+    #[cfg(target_os = "android")]
+    if let Ok(candidate) = materialize_embedded_state_agent_source() {
+        return Ok(candidate);
+    }
+
     let relative_candidates = [
         "state-agent",
         "_up_/state-agent",
@@ -135,6 +144,38 @@ fn find_state_agent_source_dir() -> AppResult<PathBuf> {
         "Could not find the bundled state-agent source directory. Reinstall this app or set NOLAND_STATE_AGENT_SOURCE_DIR to a valid source tree."
             .into(),
     ))
+}
+
+#[cfg(target_os = "android")]
+fn materialize_embedded_state_agent_source() -> AppResult<PathBuf> {
+    let extraction_root = env::temp_dir().join(format!(
+        "noland-state-agent-source-v{REQUIRED_AGENT_API_VERSION}"
+    ));
+    let source_dir = extraction_root.join("state-agent");
+    if is_state_agent_source_dir(&source_dir) {
+        return Ok(source_dir);
+    }
+
+    fs::remove_dir_all(&extraction_root).ok();
+    fs::create_dir_all(&extraction_root).map_err(|error| {
+        AppError::Command(format!(
+            "create embedded state-agent extraction directory: {error}"
+        ))
+    })?;
+
+    let decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(EMBEDDED_STATE_AGENT_SOURCE));
+    let mut archive = tar::Archive::new(decoder);
+    archive.unpack(&extraction_root).map_err(|error| {
+        AppError::Command(format!("extract embedded state-agent source: {error}"))
+    })?;
+
+    if !is_state_agent_source_dir(&source_dir) {
+        return Err(AppError::Provisioning(
+            "Embedded state-agent archive did not contain the required source tree.".into(),
+        ));
+    }
+
+    Ok(source_dir)
 }
 
 fn is_state_agent_source_dir(path: &Path) -> bool {
