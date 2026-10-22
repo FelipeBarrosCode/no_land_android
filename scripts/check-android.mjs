@@ -45,6 +45,14 @@ const stateAgentRuntime = readFileSync(
   join(root, "src-tauri", "src", "services", "shared_storage", "agent_runtime.rs"),
   "utf8",
 );
+const networkAgentRuntime = readFileSync(
+  join(root, "src-tauri", "src", "services", "network_agent.rs"),
+  "utf8",
+);
+const micReceiverRuntime = readFileSync(
+  join(root, "src-tauri", "src", "services", "mic_receiver.rs"),
+  "utf8",
+);
 const ignoreLines = new Set(
   gitignore
     .split(/\r?\n/u)
@@ -108,39 +116,33 @@ check(
   "Android capability is restricted to the main window",
 );
 
-const expectedResources = [
-  "../vm-cloud-mic-agent/Cargo.toml",
-  "../vm-cloud-mic-agent/src/**/*",
-  "../network-agent/Cargo.toml",
-  "../network-agent/Cargo.lock",
-  "../network-agent/src/**/*",
-  "../network-contracts/Cargo.toml",
-  "../network-contracts/Cargo.lock",
-  "../network-contracts/src/**/*",
-  "../state-agent/Cargo.toml",
-  "../state-agent/Cargo.lock",
-  "../state-agent/rust-toolchain.toml",
-  "../state-agent/crates/**/*",
-  "../state-agent/scripts/**/*",
-  "../state-agent/systemd/**/*",
-];
 const resources = androidConfig.bundle?.resources;
 check(
-  Array.isArray(resources) &&
-    resources.length === expectedResources.length &&
-    expectedResources.every((resource) => resources.includes(resource)),
-  "Android config preserves the shared remote-agent resources",
+  Array.isArray(resources) && resources.length === 0,
+  "Android config avoids duplicate filesystem resources that are inaccessible on-device",
 );
 
 check(
-  tauriBuildScript.includes("embed_android_state_agent_source") &&
-    tauriBuildScript.includes('append_dir_all("state-agent", &source_dir)'),
-  "Android build embeds the state-agent source archive",
+  tauriBuildScript.includes("embed_android_remote_agent_sources") &&
+    tauriBuildScript.includes('"state-agent-source.tar.gz"') &&
+    tauriBuildScript.includes('"network-agent-source.tar.gz"') &&
+    tauriBuildScript.includes('"mic-receiver-source.tar.gz"'),
+  "Android build embeds compact archives for every remote agent source tree",
 );
 check(
   stateAgentRuntime.includes("EMBEDDED_STATE_AGENT_SOURCE") &&
     stateAgentRuntime.includes("materialize_embedded_state_agent_source"),
   "Android runtime materializes the embedded state-agent source archive",
+);
+check(
+  networkAgentRuntime.includes("EMBEDDED_NETWORK_AGENT_SOURCE") &&
+    networkAgentRuntime.includes("materialize_embedded_network_agent_source"),
+  "Android runtime materializes the embedded network-agent and contracts source archive",
+);
+check(
+  micReceiverRuntime.includes("EMBEDDED_MIC_RECEIVER_SOURCE") &&
+    micReceiverRuntime.includes("materialize_embedded_receiver_source"),
+  "Android runtime materializes the embedded microphone receiver source archive",
 );
 
 if (Array.isArray(resources)) {
@@ -241,22 +243,32 @@ check(
   "Gradle compatibility injection fails clearly instead of blindly rewriting an unknown Android block shape",
 );
 
-const androidRuntimeStubPath = join(
-  root,
-  "src-tauri",
-  "native",
-  "android",
-  "noland_android_runtime_stub.c",
-);
-const androidRuntimeStub = existsSync(androidRuntimeStubPath)
-  ? readFileSync(androidRuntimeStubPath, "utf8")
-  : "";
-check(Boolean(androidRuntimeStub), "Android link-safe Moonlight runtime ABI adapter exists");
+const androidNativeRoot = join(root, "src-tauri", "native", "noland-moonlight");
+const androidNativeCmake = readFileSync(join(androidNativeRoot, "CMakeLists.txt"), "utf8");
+const androidVideoRenderer = readFileSync(join(androidNativeRoot, "src", "noland_video_renderer_android.c"), "utf8");
+const androidAudioRenderer = readFileSync(join(androidNativeRoot, "src", "noland_audio_renderer_android.c"), "utf8");
+const androidStreamBridge = readFileSync(join(root, "src-tauri", "src", "moonlight", "platform", "android.rs"), "utf8");
 check(
-  androidRuntimeStub.includes("nl_runtime_create") &&
-    androidRuntimeStub.includes("NL_RESULT_INVALID_STATE") &&
-    androidRuntimeStub.includes('return "android-shell"'),
-  "Android runtime adapter stays idle and rejects unsupported streaming",
+  !tauriBuildScript.includes('.file("native/android/noland_android_runtime_stub.c")') &&
+    androidNativeCmake.includes("noland_video_renderer_android.c") &&
+    androidNativeCmake.includes("noland_audio_renderer_android.c"),
+  "Android links the real Moonlight runtime and media renderers, not the shell stub",
+);
+check(
+  androidVideoRenderer.includes("AMediaCodec_configure") &&
+    androidVideoRenderer.includes("AMediaCodec_releaseOutputBuffer") &&
+    androidVideoRenderer.includes("LiCompleteVideoFrame(handle, result)"),
+  "Android native decoder renders to a surface and completes borrowed core frames",
+);
+check(
+  androidAudioRenderer.includes("opus_multistream_decode") && androidAudioRenderer.includes("slCreateEngine"),
+  "Android audio uses real Opus decoding and bounded OpenSL ES playback",
+);
+check(
+  androidStreamBridge.includes("ANativeWindow_fromSurface") &&
+    androidStreamBridge.includes("s.token != token") &&
+    androidStreamBridge.includes("runtime.detach_surface().await"),
+  "Android surface lifecycle rejects stale routes and waits for actor detach before release",
 );
 
 const requiredIgnorePatterns = [
@@ -288,11 +300,50 @@ const requiredOverlayFiles = [
   "app/src/main/java/com/noland/connect/stream/NativeStreamBridge.kt",
   "app/src/main/java/com/noland/connect/stream/StreamActivity.kt",
   "app/src/main/java/com/noland/connect/stream/StreamSurfaceView.kt",
+  "app/src/main/java/com/noland/connect/stream/StreamTouchController.kt",
+  "app/src/main/java/com/noland/connect/stream/StreamControlsOverlay.kt",
+  "app/src/main/java/com/noland/connect/stream/StreamKeyboardView.kt",
+  "app/src/main/java/com/noland/connect/stream/StreamHardwareInput.kt",
+  "app/src/main/java/com/noland/connect/stream/VirtualGamepadView.kt",
   "app/src/main/java/com/noland/connect/vpn/NolandVpnBridge.kt",
+  "app/src/main/java/com/noland/connect/vpn/VpnPermissionActivity.kt",
 ];
 for (const relativePath of requiredOverlayFiles) {
   check(existsSync(join(overlayRoot, relativePath)), `Android overlay provides ${relativePath}`);
 }
+
+const streamSources = join(overlayRoot, "app", "src", "main", "java", "com", "noland", "connect", "stream");
+const streamActivity = readFileSync(join(streamSources, "StreamActivity.kt"), "utf8");
+const streamControls = readFileSync(join(streamSources, "StreamControlsOverlay.kt"), "utf8");
+const streamBridge = readFileSync(join(streamSources, "NativeStreamBridge.kt"), "utf8");
+const frontendPlatform = readFileSync(join(root, "src", "lib", "platform.ts"), "utf8");
+const appFrontend = readFileSync(join(root, "src", "app", "App.tsx"), "utf8");
+check(
+  ["Trackpad", "Direct touch", "Click-to-use", "On-screen controller", "Keyboard", "Return to Noland", "Resume stream"]
+    .every((label) => streamControls.includes(`"${label}"`)),
+  "Android stream drawer exposes the reference touch modes, controller, keyboard, and navigation",
+);
+check(
+  streamActivity.includes("streamView.touchSink = object") &&
+    streamActivity.includes("routeKeyboardGesture(event)") &&
+    streamActivity.includes("toolbarSequence"),
+  "Android installs the multi-touch state machine and preserves keyboard toolbar touch ownership",
+);
+check(
+  streamActivity.includes("incarnation != 0L && !dashboardLeaving && !closedFromRust") &&
+    androidStreamBridge.includes("pub async fn present_stream()"),
+  "Android reclaims a retained Activity after dashboard handoff without restarting the session",
+);
+check(
+  ["nativePointer", "nativeButton", "nativeScroll", "nativeText", "nativeController", "nativeSuspendInput", "nativeDashboard"]
+    .every((method) => streamBridge.includes(`external fun ${method}`)),
+  "Android stream JNI declares pointer, keyboard, controller, suspension, and dashboard callbacks",
+);
+check(
+  frontendPlatform.includes('TAURI_ENV_PLATFORM === "android"') &&
+    appFrontend.includes("isMobile && embeddedMoonlightStatus?.runtimeConnected"),
+  "Android dashboard exposes connected-stream reentry instead of gating it to iOS",
+);
 
 const manifestPath = join(overlayRoot, "app", "src", "main", "AndroidManifest.xml");
 const manifest = existsSync(manifestPath) ? readFileSync(manifestPath, "utf8") : "";
@@ -300,6 +351,11 @@ check(
   manifest.includes('android:name=".stream.StreamActivity"') &&
     manifest.includes('android:exported="false"'),
   "Android stream activity is private to the application",
+);
+check(
+  manifest.includes('android:name=".vpn.VpnPermissionActivity"') &&
+    manifest.includes('android:theme="@android:style/Theme.Translucent.NoTitleBar"'),
+  "Android manifest registers the private VPN permission activity",
 );
 check(
   manifest.includes('android:allowBackup="false"') &&
@@ -369,11 +425,33 @@ check(
     vpnBridge.includes('TUNNEL_NAME = "noland"'),
   "Android VPN bridge uses the pinned tunnel library with one noland tunnel",
 );
+const vpnPermissionActivityPath = join(
+  overlayRoot,
+  "app",
+  "src",
+  "main",
+  "java",
+  "com",
+  "noland",
+  "connect",
+  "vpn",
+  "VpnPermissionActivity.kt",
+);
+const vpnPermissionActivity = existsSync(vpnPermissionActivityPath)
+  ? readFileSync(vpnPermissionActivityPath, "utf8")
+  : "";
 check(
   vpnBridge.includes("VpnService.prepare(context)") &&
-    vpnBridge.includes("Intent.FLAG_ACTIVITY_NEW_TASK") &&
+    vpnBridge.includes("VpnPermissionActivity.request(context)") &&
     vpnBridge.includes('"permission_required"'),
-  "Android VPN bridge launches the system permission flow and reports permission_required",
+  "Android VPN bridge waits for the system permission result before continuing",
+);
+check(
+  vpnPermissionActivity.includes("class VpnPermissionActivity : Activity()") &&
+    vpnPermissionActivity.includes("startActivityForResult") &&
+    vpnPermissionActivity.includes("onActivityResult") &&
+    vpnPermissionActivity.includes("CountDownLatch"),
+  "Android VPN permission activity prompts the user and reports approval to the waiting tunnel operation",
 );
 check(
   vpnBridge.includes("Context.MODE_PRIVATE") &&

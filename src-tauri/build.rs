@@ -34,6 +34,157 @@ where
     }
 }
 
+fn native_env(name: &str) -> Option<std::ffi::OsString> {
+    println!("cargo:rerun-if-env-changed={name}");
+    env::var_os(name).filter(|value| !value.is_empty())
+}
+
+fn android_sdk_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for name in ["ANDROID_HOME", "ANDROID_SDK_ROOT"] {
+        if let Some(path) = native_env(name) {
+            roots.push(PathBuf::from(path));
+        }
+    }
+    if let Some(home) = native_env("HOME") {
+        let home = PathBuf::from(home);
+        if cfg!(target_os = "macos") {
+            roots.push(home.join("Library/Android/sdk"));
+        } else {
+            roots.push(home.join("Android/Sdk"));
+        }
+    }
+    if let Some(local_app_data) = native_env("LOCALAPPDATA") {
+        roots.push(PathBuf::from(local_app_data).join("Android/Sdk"));
+    }
+    roots
+}
+
+// SDK package versions must sort numerically (e.g. NDK 29 after NDK 9).
+fn android_package_dirs(root: &Path) -> Vec<PathBuf> {
+    if root.is_dir() {
+        println!("cargo:rerun-if-changed={}", root.display());
+    }
+    let mut dirs = fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    dirs.sort_by_cached_key(|path| {
+        path.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .split(['.', '-'])
+            .filter_map(|part| part.parse::<u32>().ok())
+            .collect::<Vec<_>>()
+    });
+    dirs.reverse();
+    dirs
+}
+
+fn native_target_env(name: &str, target: &str) -> Option<std::ffi::OsString> {
+    native_env(&format!("{name}_{target}"))
+        .or_else(|| native_env(&format!("{name}_{}", target.replace('-', "_"))))
+        .or_else(|| native_env(&format!("TARGET_{name}")))
+        .or_else(|| native_env(name))
+}
+
+fn executable_on_path(name: &str) -> Option<PathBuf> {
+    env::var_os("PATH").and_then(|paths| {
+        env::split_paths(&paths)
+            .map(|dir| dir.join(format!("{name}{}", env::consts::EXE_SUFFIX)))
+            .find(|path| path.is_file())
+    })
+}
+
+fn configure_android_cmake(config: &mut cmake::Config, target: &str) {
+    let abi = match target {
+        "aarch64-linux-android" => "arm64-v8a",
+        "armv7-linux-androideabi" | "thumbv7neon-linux-androideabi" => "armeabi-v7a",
+        "i686-linux-android" => "x86",
+        "x86_64-linux-android" => "x86_64",
+        _ => panic!("unsupported Android native target: {target}"),
+    };
+    let mut sdk_roots = android_sdk_roots();
+    let ndk = [
+        "ANDROID_NDK_HOME",
+        "NDK_HOME", // Set by Tauri/cargo-mobile when invoking Cargo.
+        "ANDROID_NDK_ROOT",
+        "NDK_ROOT",
+        "TAURI_ANDROID_NDK_HOME",
+        "TAURI_ANDROID_NDK_ROOT",
+        "CMAKE_ANDROID_NDK",
+    ]
+    .into_iter()
+    .find_map(|name| native_env(name).map(PathBuf::from))
+    .or_else(|| {
+        sdk_roots.iter().find_map(|sdk| {
+            android_package_dirs(&sdk.join("ndk"))
+                .into_iter()
+                .chain(std::iter::once(sdk.join("ndk-bundle")))
+                .find(|ndk| ndk.join("build/cmake/android.toolchain.cmake").is_file())
+        })
+    })
+    .expect("Android NDK not found: set ANDROID_NDK_HOME or NDK_HOME to an installed NDK");
+    let toolchain = ndk.join("build/cmake/android.toolchain.cmake");
+    assert!(
+        toolchain.is_file(),
+        "invalid Android NDK {}: missing build/cmake/android.toolchain.cmake",
+        ndk.display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        ndk.join("source.properties").display()
+    );
+    if let Some(packages) = ndk.parent().filter(|path| path.ends_with("ndk")) {
+        if let Some(sdk) = packages.parent() {
+            sdk_roots.push(sdk.to_path_buf());
+        }
+    }
+
+    // Respect cmake-rs's target-specific overrides, then discover an SDK CMake
+    // installation or PATH executable. No developer-specific SDK/version paths.
+    let cmake = native_target_env("CMAKE", target)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            sdk_roots
+                .iter()
+                .flat_map(|sdk| android_package_dirs(&sdk.join("cmake")))
+                .map(|dir| dir.join(format!("bin/cmake{}", env::consts::EXE_SUFFIX)))
+                .find(|path| path.is_file())
+                .or_else(|| executable_on_path("cmake"))
+                .expect("CMake not found: install the Android SDK CMake package or set CMAKE")
+        });
+    // cmake-rs selects its executable from the process environment, not Config::env.
+    env::set_var("CMAKE", &cmake);
+    let generator = native_target_env("CMAKE_GENERATOR", target);
+    if generator.as_ref().map_or(true, |value| value == "Ninja") {
+        let ninja = cmake
+            .parent()
+            .map(|dir| dir.join(format!("ninja{}", env::consts::EXE_SUFFIX)))
+            .filter(|path| path.is_file())
+            .or_else(|| executable_on_path("ninja"))
+            .expect("Ninja not found: install the Android SDK CMake package or add ninja to PATH");
+        config
+            .generator("Ninja")
+            .define("CMAKE_MAKE_PROGRAM", ninja);
+    }
+    let platform = native_env("ANDROID_PLATFORM")
+        .or_else(|| native_env("ANDROID_API_LEVEL"))
+        .or_else(|| native_env("NDK_API_LEVEL"))
+        .unwrap_or_else(|| "android-24".into());
+    config
+        .define("CMAKE_TOOLCHAIN_FILE", toolchain)
+        .define("ANDROID_ABI", abi)
+        .define("ANDROID_PLATFORM", platform)
+        .define("ANDROID_STL", "c++_static")
+        .define("CMAKE_POSITION_INDEPENDENT_CODE", "ON")
+        // Avoid building/installing unrelated MbedTLS TLS/X.509 libraries.
+        .build_target("noland_moonlight");
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=NOLAND_SKIP_APP_BUILD_RS");
     println!("cargo:rerun-if-env-changed=NOLAND_SKIP_NATIVE_BUILD");
@@ -52,7 +203,7 @@ fn main() {
     let is_desktop = is_macos || is_linux || is_windows;
 
     if is_android {
-        embed_android_state_agent_source();
+        embed_android_remote_agent_sources();
     }
 
     if is_ios {
@@ -68,17 +219,7 @@ fn main() {
         println!("cargo:rustc-link-arg-cdylib=-Wl,-undefined,dynamic_lookup");
     }
 
-    if is_android {
-        println!("cargo:rerun-if-changed=native/android/noland_android_runtime_stub.c");
-        println!("cargo:rerun-if-changed=native/noland-moonlight/include/noland_moonlight.h");
-        cc::Build::new()
-            .file("native/android/noland_android_runtime_stub.c")
-            .include("native/noland-moonlight/include")
-            .flag_if_supported("-Wno-unused-parameter")
-            .compile("noland_android_runtime");
-    }
-
-    if is_android || matches!(env::var("NOLAND_SKIP_NATIVE_BUILD").as_deref(), Ok("1")) {
+    if matches!(env::var("NOLAND_SKIP_NATIVE_BUILD").as_deref(), Ok("1")) {
         if target.ends_with("apple-darwin") {
             cc::Build::new()
                 .file("src/moonlight/platform/macos_display_detect.m")
@@ -225,6 +366,10 @@ fn main() {
         "noland-moonlight/src/noland_audio_renderer_ios.m",
         "noland-moonlight/src/noland_microphone_ios.m",
         "noland-moonlight/src/noland_input_ios.c",
+        "noland-moonlight/src/noland_video_renderer_android.c",
+        "noland-moonlight/src/noland_audio_renderer_android.c",
+        "noland-moonlight/src/noland_input_android.c",
+        "moonlight-common-c/CMakeLists.txt",
     ] {
         println!(
             "cargo:rerun-if-changed={}",
@@ -245,6 +390,10 @@ fn main() {
     cmake_config
         .define("BUILD_NOLAND_MOONLIGHT_HARNESS", "OFF")
         .define("BUILD_NOLAND_MOONLIGHT_TESTS", "OFF");
+
+    if is_android {
+        configure_android_cmake(&mut cmake_config, &target);
+    }
 
     if is_macos || is_windows || is_linux {
         if is_macos {
@@ -308,8 +457,8 @@ fn main() {
     let static_lib_dir = dst.join("lib/static");
     let moonlight_common_lib_dir = dst.join("build/moonlight-common-c");
     let enet_lib_dir = dst.join("build/moonlight-common-c/enet");
-    let ios_opus_lib_dir = dst.join("build/_deps/opus-build");
-    let ios_mbedtls_lib_dir = dst.join("build/_deps/mbedtls-build/library");
+    let mobile_opus_lib_dir = dst.join("build/_deps/opus-build");
+    let mobile_mbedtls_lib_dir = dst.join("build/_deps/mbedtls-build/library");
     let windows_config = if is_windows { Some("Release") } else { None };
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!(
@@ -321,14 +470,20 @@ fn main() {
         moonlight_common_lib_dir.display()
     );
     println!("cargo:rustc-link-search=native={}", enet_lib_dir.display());
-    if is_ios {
+    if is_ios || is_android {
         println!(
             "cargo:rustc-link-search=native={}",
-            ios_opus_lib_dir.display()
+            mobile_opus_lib_dir.display()
         );
         println!(
             "cargo:rustc-link-search=native={}",
-            ios_mbedtls_lib_dir.display()
+            mobile_mbedtls_lib_dir.display()
+        );
+    }
+    if is_android {
+        println!(
+            "cargo:rustc-link-search=native={}",
+            dst.join("build/noland-moonlight").display()
         );
     }
     if let Some(config) = windows_config {
@@ -352,9 +507,16 @@ fn main() {
     println!("cargo:rustc-link-lib=static=noland_moonlight");
     println!("cargo:rustc-link-lib=static=moonlight-common-c");
     println!("cargo:rustc-link-lib=static=enet");
-    if is_ios {
+    if is_ios || is_android {
         println!("cargo:rustc-link-lib=static=opus");
         println!("cargo:rustc-link-lib=static=mbedcrypto");
+    }
+    if is_android {
+        for library in ["android", "log", "mediandk", "OpenSLES", "m"] {
+            println!("cargo:rustc-link-lib={library}");
+        }
+    }
+    if is_ios {
         println!("cargo:rustc-link-lib=framework=UIKit");
         println!("cargo:rustc-link-lib=framework=AVFoundation");
         println!("cargo:rustc-link-lib=framework=AudioToolbox");
@@ -454,36 +616,87 @@ fn main() {
     tauri_build::build()
 }
 
-fn embed_android_state_agent_source() {
+fn embed_android_remote_agent_sources() {
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is not set"));
-    let source_dir = manifest_dir.join("../state-agent");
-    let output = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is not set"))
-        .join("state-agent-source.tar.gz");
 
-    for path in [
-        "../state-agent/Cargo.toml",
-        "../state-agent/Cargo.lock",
-        "../state-agent/rust-toolchain.toml",
-        "../state-agent/crates",
-        "../state-agent/scripts",
-        "../state-agent/systemd",
-    ] {
-        println!("cargo:rerun-if-changed={path}");
-    }
+    embed_android_source_archive(
+        "state-agent-source.tar.gz",
+        &[(
+            "state-agent",
+            manifest_dir.join("../state-agent"),
+            &[
+                "Cargo.toml",
+                "Cargo.lock",
+                "rust-toolchain.toml",
+                "crates",
+                "scripts",
+                "systemd",
+            ],
+        )],
+    );
+    embed_android_source_archive(
+        "network-agent-source.tar.gz",
+        &[
+            (
+                "network-agent",
+                manifest_dir.join("../network-agent"),
+                &["Cargo.toml", "Cargo.lock", "src"],
+            ),
+            (
+                "network-contracts",
+                manifest_dir.join("../network-contracts"),
+                &["Cargo.toml", "Cargo.lock", "src"],
+            ),
+        ],
+    );
+    embed_android_source_archive(
+        "mic-receiver-source.tar.gz",
+        &[(
+            "vm-cloud-mic-agent",
+            manifest_dir.join("../vm-cloud-mic-agent"),
+            &["Cargo.toml", "Cargo.lock", "src"],
+        )],
+    );
+}
 
-    let archive_file =
-        fs::File::create(&output).expect("failed to create embedded state-agent archive");
+fn embed_android_source_archive(output_name: &str, roots: &[(&str, PathBuf, &[&str])]) {
+    let output = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is not set")).join(output_name);
+    let archive_file = fs::File::create(&output).unwrap_or_else(|error| {
+        panic!("failed to create embedded source archive {output_name}: {error}")
+    });
     let encoder = flate2::write::GzEncoder::new(archive_file, flate2::Compression::best());
     let mut archive = tar::Builder::new(encoder);
-    archive
-        .append_dir_all("state-agent", &source_dir)
-        .expect("failed to archive state-agent source tree");
+
+    for (archive_root, source_root, entries) in roots {
+        archive
+            .append_dir(archive_root, source_root)
+            .unwrap_or_else(|error| panic!("failed to archive {archive_root}: {error}"));
+        for relative in *entries {
+            let source = source_root.join(relative);
+            println!("cargo:rerun-if-changed={}", source.display());
+            let destination = Path::new(archive_root).join(relative);
+            if source.is_dir() {
+                archive
+                    .append_dir_all(&destination, &source)
+                    .unwrap_or_else(|error| {
+                        panic!("failed to archive {}: {error}", source.display())
+                    });
+            } else {
+                archive
+                    .append_path_with_name(&source, &destination)
+                    .unwrap_or_else(|error| {
+                        panic!("failed to archive {}: {error}", source.display())
+                    });
+            }
+        }
+    }
+
     archive
         .into_inner()
-        .expect("failed to finish state-agent tar archive")
+        .unwrap_or_else(|error| panic!("failed to finish {output_name} tar archive: {error}"))
         .finish()
-        .expect("failed to finish state-agent gzip archive");
+        .unwrap_or_else(|error| panic!("failed to finish {output_name} gzip archive: {error}"));
 }
 
 fn write_static_noland_moonlight_bindings() {
@@ -564,6 +777,7 @@ pub const nl_surface_type_NL_SURFACE_MACOS_NSVIEW: nl_surface_type_t = 2;
 pub const nl_surface_type_NL_SURFACE_X11_WINDOW: nl_surface_type_t = 3;
 pub const nl_surface_type_NL_SURFACE_WAYLAND_SURFACE: nl_surface_type_t = 4;
 pub const nl_surface_type_NL_SURFACE_IOS_UIVIEW: nl_surface_type_t = 5;
+pub const nl_surface_type_NL_SURFACE_ANDROID_NATIVE_WINDOW: nl_surface_type_t = 6;
 
 pub type nl_pacing_mode_t = ::std::os::raw::c_uint;
 pub const nl_pacing_mode_NL_PACING_MODE_OFF: nl_pacing_mode_t = 0;

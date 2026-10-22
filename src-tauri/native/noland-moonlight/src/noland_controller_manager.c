@@ -16,9 +16,8 @@ extern void nl_ios_controller_set_motion(uint16_t controller_number, uint8_t mot
 #endif
 #endif
 
-// UIKit/GameController owns controllers on iOS. Keep SDL controller handling
-// for desktop Apple platforms only.
-#if (defined(__APPLE__) && TARGET_OS_OSX) || defined(__linux__) || defined(_WIN32)
+// Mobile platform bridges own controllers; SDL is only used on desktop.
+#if (defined(__APPLE__) && TARGET_OS_OSX) || (defined(__linux__) && !defined(__ANDROID__)) || defined(_WIN32)
 
 #include <SDL.h>
 

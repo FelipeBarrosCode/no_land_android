@@ -11,7 +11,7 @@ typedef struct nl_audio_renderer {
   uint32_t maximum_buffer_ms;
 } nl_audio_renderer_t;
 
-#if defined(__APPLE__)
+#if defined(__ANDROID__) || defined(__APPLE__)
 int nl_audio_renderer_init(nl_audio_renderer_t* renderer,
                            int audio_configuration,
                            const POPUS_MULTISTREAM_CONFIGURATION opus_config,

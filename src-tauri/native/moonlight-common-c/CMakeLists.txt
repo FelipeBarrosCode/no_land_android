@@ -63,13 +63,13 @@ endif()
 
 if (USE_MBEDTLS)
   target_compile_definitions(moonlight-common-c PRIVATE USE_MBEDTLS)
-  find_package(MbedTLS QUIET)
-  if (MBEDTLS_FOUND)
+  if(TARGET mbedcrypto)
+    # Prefer the parent's pinned source build over any installed host library.
+    target_link_libraries(moonlight-common-c PRIVATE mbedcrypto)
+  else()
+    find_package(MbedTLS REQUIRED)
     target_link_libraries(moonlight-common-c PRIVATE ${MBEDCRYPTO_LIBRARY})
     target_include_directories(moonlight-common-c SYSTEM PRIVATE ${MBEDTLS_INCLUDE_DIRS})
-  else()
-    # For sub project added via CMake
-    target_link_libraries(moonlight-common-c PRIVATE mbedcrypto)
   endif()
 elseif(WIN32)
   target_link_libraries(moonlight-common-c PRIVATE bcrypt.lib)
@@ -93,6 +93,8 @@ endif()
 
 if (NOT(MSVC OR APPLE))
   include(CheckLibraryExists)
+  include(CheckFunctionExists)
+  include(CheckCSourceCompiles)
   CHECK_LIBRARY_EXISTS(rt clock_gettime "" HAVE_CLOCK_GETTIME)
 
   if (NOT HAVE_CLOCK_GETTIME)
@@ -103,7 +105,7 @@ if (NOT(MSVC OR APPLE))
 
   foreach(clock CLOCK_MONOTONIC CLOCK_MONOTONIC_RAW)
     message(STATUS "Testing whether ${clock} can be used")
-    CHECK_CXX_SOURCE_COMPILES(
+    CHECK_C_SOURCE_COMPILES(
 "#define _POSIX_C_SOURCE 200112L
 #include <time.h>
 int main ()

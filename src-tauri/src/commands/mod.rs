@@ -32,6 +32,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+#[cfg(target_os = "android")]
+use crate::moonlight::platform::android;
+#[cfg(not(target_os = "android"))]
+use crate::moonlight::platform::{create_or_reuse_stream_window, stream_window_surface_descriptor};
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 use crate::services::wireguard::{locate_noland_net_helper_binary, locate_wintun_library};
 use crate::{
@@ -72,9 +76,9 @@ use crate::{
             gamestream::ReqwestGameStreamHttpClient, persistence::MoonlightStateRepository,
         },
         platform::{
-            activate_native_stream_input, close_stream_window, create_or_reuse_stream_window,
-            deactivate_native_stream_input, install_native_stream_input, present_stream_window,
-            set_native_stream_input_debug_overlay_enabled, stream_window_surface_descriptor,
+            activate_native_stream_input, close_stream_window, deactivate_native_stream_input,
+            install_native_stream_input, present_stream_window,
+            set_native_stream_input_debug_overlay_enabled,
         },
         runtime::NativeStartRequest,
     },
@@ -533,6 +537,7 @@ pub async fn export_diagnostic_report(
 }
 
 fn moonlight_frontend_error(error: crate::moonlight::domain::MoonlightError) -> FrontendError {
+    warn!(%error, "Moonlight operation failed");
     match error {
         crate::moonlight::domain::MoonlightError::Validation(message)
         | crate::moonlight::domain::MoonlightError::IdentityInvalid(message) => FrontendError {
@@ -607,33 +612,47 @@ async fn stop_active_stream_if_needed(
     app: &AppHandle,
     moonlight: &MoonlightManager,
 ) -> Result<(), FrontendError> {
-    stop_network_monitor(app).await;
-    let state = moonlight
-        .runtime
-        .get_state()
-        .await
-        .map_err(moonlight_frontend_error)?;
-
-    if matches!(state, SessionState::Idle) {
-        return Ok(());
+    #[cfg(target_os = "android")]
+    {
+        let _ = moonlight;
+        moonlight_disconnect_stream(
+            app.clone(),
+            app.state::<AppContext>(),
+            app.state::<MoonlightManager>(),
+        )
+        .await?;
+        Ok(())
     }
+    #[cfg(not(target_os = "android"))]
+    {
+        stop_network_monitor(app).await;
+        let state = moonlight
+            .runtime
+            .get_state()
+            .await
+            .map_err(moonlight_frontend_error)?;
 
-    moonlight
-        .runtime
-        .stop()
-        .await
-        .map_err(moonlight_frontend_error)?;
-    moonlight
-        .runtime
-        .detach_surface()
-        .await
-        .map_err(moonlight_frontend_error)?;
-    moonlight.input.end_capture();
-    if let Ok(mut active_preferences) = moonlight.active_session_preferences.lock() {
-        *active_preferences = None;
+        if matches!(state, SessionState::Idle) {
+            return Ok(());
+        }
+
+        moonlight
+            .runtime
+            .stop()
+            .await
+            .map_err(moonlight_frontend_error)?;
+        moonlight
+            .runtime
+            .detach_surface()
+            .await
+            .map_err(moonlight_frontend_error)?;
+        moonlight.input.end_capture();
+        if let Ok(mut active_preferences) = moonlight.active_session_preferences.lock() {
+            *active_preferences = None;
+        }
+        close_stream_window(app).map_err(moonlight_frontend_error)?;
+        Ok(())
     }
-    close_stream_window(app).map_err(moonlight_frontend_error)?;
-    Ok(())
 }
 
 fn parse_capture_mouse_mode(mode: &str) -> Result<CaptureMouseMode, FrontendError> {
@@ -733,6 +752,7 @@ async fn repair_stream_connection_after_failure(
     Ok(true)
 }
 
+#[cfg(not(target_os = "android"))]
 async fn start_runtime_with_connection_repair(
     context: &AppContext,
     moonlight: &MoonlightManager,
@@ -798,6 +818,7 @@ async fn start_runtime_with_connection_repair(
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 fn clear_active_stream_instance(moonlight: &MoonlightManager, expected: Option<u64>) {
     let Some(expected) = expected else {
         return;
@@ -809,6 +830,7 @@ fn clear_active_stream_instance(moonlight: &MoonlightManager, expected: Option<u
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn schedule_failed_start_repair(
     context: AppContext,
     runtime: crate::moonlight::runtime::MoonlightRuntimeHandle,
@@ -1486,8 +1508,13 @@ async fn schedule_microphone_for_game_stream(
     context: &AppContext,
     moonlight: &MoonlightManager,
     host_id: &str,
+    #[cfg(target_os = "android")] generation: i64,
 ) {
     let instance_id = MicPassthroughService::instance_id_for_game_stream(context, host_id).await;
+    #[cfg(target_os = "android")]
+    if !android_stream_is_current(generation) {
+        return;
+    }
     let previous_instance_id =
         moonlight
             .active_stream_instance_id
@@ -1505,6 +1532,12 @@ async fn schedule_microphone_for_game_stream(
     let mic_context = context.clone();
     let active_instance = moonlight.active_stream_instance_id.clone();
     tauri::async_runtime::spawn(async move {
+        #[cfg(target_os = "android")]
+        let _bookkeeping = ANDROID_STREAM_BOOKKEEPING.lock().await;
+        #[cfg(target_os = "android")]
+        if !android_stream_is_current(generation) {
+            return;
+        }
         if let Some(previous_instance_id) =
             previous_instance_id.filter(|previous| *previous != instance_id)
         {
@@ -1522,12 +1555,18 @@ async fn schedule_microphone_for_game_stream(
         if !still_active {
             return;
         }
+        #[cfg(target_os = "android")]
+        if !android_stream_is_current(generation) {
+            return;
+        }
         match MicPassthroughService::auto_start_for_game_stream(&mic_context, instance_id).await {
             Ok(true) => {
                 let still_active = active_instance
                     .lock()
                     .ok()
                     .is_some_and(|active| *active == Some(instance_id));
+                #[cfg(target_os = "android")]
+                let still_active = still_active && android_stream_is_current(generation);
                 if still_active {
                     info!(instance_id, "Microphone auto-connected for game stream");
                 } else if let Err(error) =
@@ -1617,6 +1656,172 @@ pub async fn set_instance_performance_overlay(
     Ok(enabled)
 }
 
+// Only command bookkeeping uses this lock. Never hold it while awaiting Android
+// start_stream: the coordinator holds its renderer lock during full disconnect.
+#[cfg(target_os = "android")]
+static ANDROID_STREAM_BOOKKEEPING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(target_os = "android")]
+fn android_stream_is_current(generation: i64) -> bool {
+    android::current_generation().is_ok_and(|current| current == generation)
+}
+
+#[cfg(target_os = "android")]
+struct AndroidStreamStartup {
+    generation: i64,
+    completed: bool,
+}
+
+#[cfg(target_os = "android")]
+impl AndroidStreamStartup {
+    fn check(&self) -> Result<(), FrontendError> {
+        if android_stream_is_current(self.generation) {
+            Ok(())
+        } else {
+            Err(moonlight_frontend_error(
+                crate::moonlight::domain::MoonlightError::Native(
+                    "Android stream startup was cancelled before command completion".into(),
+                ),
+            ))
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+impl Drop for AndroidStreamStartup {
+    fn drop(&mut self) {
+        if !self.completed {
+            android::request_stop(self.generation);
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+async fn start_android_stream(
+    app: &AppHandle,
+    context: &AppContext,
+    moonlight: &MoonlightManager,
+    host_id: &str,
+    app_id: u32,
+    prepared: &moonlight_launch::PreparedStreamStart,
+    deploy_network_agent: bool,
+) -> Result<MoonlightStartStreamResponse, FrontendError> {
+    let (stream_window, mut startup, instance_id) = {
+        let _bookkeeping = ANDROID_STREAM_BOOKKEEPING.lock().await;
+        let app = app.clone();
+        let width = prepared.preferences.video.width;
+        let height = prepared.preferences.video.height;
+        let (window, startup) = tauri::async_runtime::spawn_blocking(move || {
+            let (window, generation) = android::create_stream_window(&app, width, height)?;
+            // Construct the guard on the worker so a dropped command also cleans up
+            // a window that finishes creation after its join future was cancelled.
+            Ok::<_, crate::moonlight::domain::MoonlightError>((
+                window,
+                AndroidStreamStartup {
+                    generation,
+                    completed: false,
+                },
+            ))
+        })
+        .await
+        .map_err(|error| {
+            moonlight_frontend_error(crate::moonlight::domain::MoonlightError::Native(format!(
+                "Android stream-window creation task failed: {error}"
+            )))
+        })?
+        .map_err(moonlight_frontend_error)?;
+        startup.check()?;
+        let show_input_debug_hud = context
+            .state
+            .read()
+            .await
+            .moonlight_preferences
+            .show_input_debug_hud
+            != 0;
+        startup.check()?;
+        set_native_stream_input_debug_overlay_enabled(show_input_debug_hud);
+        moonlight
+            .input
+            .set_mouse_mode(match prepared.preferences.input.mouse_mode {
+                crate::moonlight::domain::MouseMode::Relative => CaptureMouseMode::Relative,
+                crate::moonlight::domain::MouseMode::Absolute => CaptureMouseMode::Absolute,
+            });
+        moonlight.input.set_stream_dimensions(width, height);
+        install_native_stream_input(&window, moonlight.input.clone())
+            .map_err(moonlight_frontend_error)?;
+        let state = context.load_state().await;
+        startup.check()?;
+        let instance_id = resolve_instance_id_for_embedded_host(&state, host_id);
+        if let Ok(mut active_instance) = moonlight.active_stream_instance_id.lock() {
+            *active_instance = instance_id;
+        }
+        if let Ok(mut active_preferences) = moonlight.active_session_preferences.lock() {
+            *active_preferences = Some(prepared.preferences.clone());
+        }
+        context.set_stream_network_active(true);
+        (window, startup, instance_id)
+    };
+
+    android::start_stream(
+        startup.generation,
+        NativeStartRequest {
+            host_id: host_id.to_owned(),
+            app_id,
+            host_address: prepared.host_address.clone(),
+            app_version: prepared.app_version.clone(),
+            gfe_version: prepared.gfe_version.clone(),
+            session_url: prepared.launch_result.rtsp_session_url.clone(),
+            server_codec_mode_support: prepared.server_codec_mode_support,
+            preferences: prepared.preferences.clone(),
+            supported_video_formats: prepared.supported_video_formats,
+            remote_input_key: prepared.remote_input_key,
+            remote_input_iv: prepared.remote_input_iv,
+            session_generation: 0,
+        },
+    )
+    .await
+    .map_err(moonlight_frontend_error)?;
+    startup.check()?;
+
+    if deploy_network_agent {
+        if let Some(instance_id) = instance_id {
+            ensure_network_agent_for_stream(context, instance_id).await;
+            startup.check()?;
+        }
+    }
+
+    let _bookkeeping = ANDROID_STREAM_BOOKKEEPING.lock().await;
+    startup.check()?;
+    schedule_microphone_for_game_stream(context, moonlight, host_id, startup.generation).await;
+    startup.check()?;
+    android::present_generation(startup.generation).map_err(moonlight_frontend_error)?;
+    let preferred_capture_mode = match prepared.preferences.input.mouse_mode {
+        crate::moonlight::domain::MouseMode::Relative => CaptureMouseMode::Relative,
+        crate::moonlight::domain::MouseMode::Absolute => CaptureMouseMode::Absolute,
+    };
+    activate_native_stream_input(&stream_window, preferred_capture_mode)
+        .map_err(moonlight_frontend_error)?;
+    startup.check()?;
+    start_network_monitor(app, prepared.host_address.clone()).await;
+    startup.check()?;
+    let state = moonlight
+        .runtime
+        .get_state()
+        .await
+        .map_err(moonlight_frontend_error)?;
+    startup.check()?;
+    startup.completed = true;
+    Ok(MoonlightStartStreamResponse {
+        operation: match prepared.launch_result.operation {
+            crate::moonlight::domain::LaunchOperation::Launch => "launch",
+            crate::moonlight::domain::LaunchOperation::Resume => "resume",
+        }
+        .to_string(),
+        state: session_state_name(&state).to_string(),
+        has_session_url: prepared.launch_result.rtsp_session_url.is_some(),
+    })
+}
+
 async fn start_embedded_stream_for_host(
     app: &AppHandle,
     context: &AppContext,
@@ -1695,122 +1900,129 @@ async fn start_embedded_stream_for_host(
     };
 
     prepare_performance_overlay(context, moonlight, &host_id, &mut prepared.preferences).await?;
-    moonlight
-        .input
-        .set_mouse_mode(match prepared.preferences.input.mouse_mode {
-            crate::moonlight::domain::MouseMode::Relative => {
-                crate::input::state::MouseMode::Relative
-            }
-            crate::moonlight::domain::MouseMode::Absolute => {
-                crate::input::state::MouseMode::Absolute
-            }
-        });
-    moonlight.input.set_stream_dimensions(
-        prepared.preferences.video.width,
-        prepared.preferences.video.height,
-    );
-
-    info!(
-        host_id = %host_id,
-        app_id,
-        width = prepared.preferences.video.width,
-        height = prepared.preferences.video.height,
-        "Moonlight Play reached native stream-window creation"
-    );
-    let stream_window = create_or_reuse_stream_window(
-        app,
-        prepared.preferences.video.width,
-        prepared.preferences.video.height,
-        &prepared.host_address,
-    )
-    .map_err(moonlight_frontend_error)?;
-    info!("Moonlight native stream window created or reused");
-    set_native_stream_input_debug_overlay_enabled(
-        app.state::<AppContext>()
-            .state
-            .read()
-            .await
-            .moonlight_preferences
-            .show_input_debug_hud
-            != 0,
-    );
-    install_native_stream_input(&stream_window, moonlight.input.clone())
-        .map_err(moonlight_frontend_error)?;
-    info!("Moonlight native stream input bridge installed");
-    let surface =
-        stream_window_surface_descriptor(&stream_window).map_err(moonlight_frontend_error)?;
-    info!(
-        surface_type = ?surface.surface_type,
-        window_handle = surface.window_handle,
-        width = surface.width,
-        height = surface.height,
-        "Moonlight native stream surface acquired"
-    );
-
-    if let Err(error) = moonlight.runtime.attach_surface(surface).await {
-        let _ = close_stream_window(app);
-        return Err(moonlight_frontend_error(error));
-    }
-    info!("Moonlight native renderer surface attached");
-
-    if let Ok(mut active_preferences) = moonlight.active_session_preferences.lock() {
-        *active_preferences = Some(prepared.preferences.clone());
-    }
-
-    if let Err(error) = start_runtime_with_connection_repair(
-        context,
-        moonlight,
-        &host_id,
-        NativeStartRequest {
-            host_id: host_id.clone(),
-            app_id,
-            host_address: prepared.host_address.clone(),
-            app_version: prepared.app_version.clone(),
-            gfe_version: prepared.gfe_version.clone(),
-            session_url: prepared.launch_result.rtsp_session_url.clone(),
-            server_codec_mode_support: prepared.server_codec_mode_support,
-            preferences: prepared.preferences.clone(),
-            supported_video_formats: prepared.supported_video_formats,
-            remote_input_key: prepared.remote_input_key,
-            remote_input_iv: prepared.remote_input_iv,
-            session_generation: 0,
-        },
-    )
-    .await
+    #[cfg(target_os = "android")]
     {
-        context.set_stream_network_active(false);
-        let _ = moonlight.runtime.detach_surface().await;
-        if let Ok(mut active_preferences) = moonlight.active_session_preferences.lock() {
-            *active_preferences = None;
-        }
-        let _ = close_stream_window(app);
-        return Err(error);
+        start_android_stream(app, context, moonlight, &host_id, app_id, &prepared, false).await
     }
+    #[cfg(not(target_os = "android"))]
+    {
+        moonlight
+            .input
+            .set_mouse_mode(match prepared.preferences.input.mouse_mode {
+                crate::moonlight::domain::MouseMode::Relative => {
+                    crate::input::state::MouseMode::Relative
+                }
+                crate::moonlight::domain::MouseMode::Absolute => {
+                    crate::input::state::MouseMode::Absolute
+                }
+            });
+        moonlight.input.set_stream_dimensions(
+            prepared.preferences.video.width,
+            prepared.preferences.video.height,
+        );
 
-    schedule_microphone_for_game_stream(context, moonlight, &host_id).await;
-
-    present_stream_window(&stream_window).map_err(moonlight_frontend_error)?;
-    let preferred_capture_mode = match prepared.preferences.input.mouse_mode {
-        crate::moonlight::domain::MouseMode::Relative => CaptureMouseMode::Relative,
-        crate::moonlight::domain::MouseMode::Absolute => CaptureMouseMode::Absolute,
-    };
-    let _ = activate_native_stream_input(&stream_window, preferred_capture_mode);
-    start_network_monitor(app, prepared.host_address.clone()).await;
-
-    let state = moonlight
-        .runtime
-        .get_state()
-        .await
+        info!(
+            host_id = %host_id,
+            app_id,
+            width = prepared.preferences.video.width,
+            height = prepared.preferences.video.height,
+            "Moonlight Play reached native stream-window creation"
+        );
+        let stream_window = create_or_reuse_stream_window(
+            app,
+            prepared.preferences.video.width,
+            prepared.preferences.video.height,
+            &prepared.host_address,
+        )
         .map_err(moonlight_frontend_error)?;
-    Ok(MoonlightStartStreamResponse {
-        operation: match prepared.launch_result.operation {
-            crate::moonlight::domain::LaunchOperation::Launch => "launch",
-            crate::moonlight::domain::LaunchOperation::Resume => "resume",
+        info!("Moonlight native stream window created or reused");
+        set_native_stream_input_debug_overlay_enabled(
+            app.state::<AppContext>()
+                .state
+                .read()
+                .await
+                .moonlight_preferences
+                .show_input_debug_hud
+                != 0,
+        );
+        install_native_stream_input(&stream_window, moonlight.input.clone())
+            .map_err(moonlight_frontend_error)?;
+        info!("Moonlight native stream input bridge installed");
+        let surface =
+            stream_window_surface_descriptor(&stream_window).map_err(moonlight_frontend_error)?;
+        info!(
+            surface_type = ?surface.surface_type,
+            window_handle = surface.window_handle,
+            width = surface.width,
+            height = surface.height,
+            "Moonlight native stream surface acquired"
+        );
+
+        if let Err(error) = moonlight.runtime.attach_surface(surface).await {
+            let _ = close_stream_window(app);
+            return Err(moonlight_frontend_error(error));
         }
-        .to_string(),
-        state: session_state_name(&state).to_string(),
-        has_session_url: prepared.launch_result.rtsp_session_url.is_some(),
-    })
+        info!("Moonlight native renderer surface attached");
+
+        if let Ok(mut active_preferences) = moonlight.active_session_preferences.lock() {
+            *active_preferences = Some(prepared.preferences.clone());
+        }
+
+        if let Err(error) = start_runtime_with_connection_repair(
+            context,
+            moonlight,
+            &host_id,
+            NativeStartRequest {
+                host_id: host_id.clone(),
+                app_id,
+                host_address: prepared.host_address.clone(),
+                app_version: prepared.app_version.clone(),
+                gfe_version: prepared.gfe_version.clone(),
+                session_url: prepared.launch_result.rtsp_session_url.clone(),
+                server_codec_mode_support: prepared.server_codec_mode_support,
+                preferences: prepared.preferences.clone(),
+                supported_video_formats: prepared.supported_video_formats,
+                remote_input_key: prepared.remote_input_key,
+                remote_input_iv: prepared.remote_input_iv,
+                session_generation: 0,
+            },
+        )
+        .await
+        {
+            context.set_stream_network_active(false);
+            let _ = moonlight.runtime.detach_surface().await;
+            if let Ok(mut active_preferences) = moonlight.active_session_preferences.lock() {
+                *active_preferences = None;
+            }
+            let _ = close_stream_window(app);
+            return Err(error);
+        }
+
+        schedule_microphone_for_game_stream(context, moonlight, &host_id).await;
+
+        present_stream_window(&stream_window).map_err(moonlight_frontend_error)?;
+        let preferred_capture_mode = match prepared.preferences.input.mouse_mode {
+            crate::moonlight::domain::MouseMode::Relative => CaptureMouseMode::Relative,
+            crate::moonlight::domain::MouseMode::Absolute => CaptureMouseMode::Absolute,
+        };
+        let _ = activate_native_stream_input(&stream_window, preferred_capture_mode);
+        start_network_monitor(app, prepared.host_address.clone()).await;
+
+        let state = moonlight
+            .runtime
+            .get_state()
+            .await
+            .map_err(moonlight_frontend_error)?;
+        Ok(MoonlightStartStreamResponse {
+            operation: match prepared.launch_result.operation {
+                crate::moonlight::domain::LaunchOperation::Launch => "launch",
+                crate::moonlight::domain::LaunchOperation::Resume => "resume",
+            }
+            .to_string(),
+            state: session_state_name(&state).to_string(),
+            has_session_url: prepared.launch_result.rtsp_session_url.is_some(),
+        })
+    }
 }
 
 #[tauri::command]
@@ -5335,124 +5547,151 @@ pub async fn moonlight_start_stream(
         &mut prepared.preferences,
     )
     .await?;
-    moonlight
-        .input
-        .set_mouse_mode(match prepared.preferences.input.mouse_mode {
-            crate::moonlight::domain::MouseMode::Relative => {
-                crate::input::state::MouseMode::Relative
-            }
-            crate::moonlight::domain::MouseMode::Absolute => {
-                crate::input::state::MouseMode::Absolute
-            }
-        });
-    moonlight.input.set_stream_dimensions(
-        prepared.preferences.video.width,
-        prepared.preferences.video.height,
-    );
-
-    let stream_window = create_or_reuse_stream_window(
-        &app,
-        prepared.preferences.video.width,
-        prepared.preferences.video.height,
-        &prepared.host_address,
-    )
-    .map_err(moonlight_frontend_error)?;
-    set_native_stream_input_debug_overlay_enabled(
-        app.state::<AppContext>()
-            .state
-            .read()
-            .await
-            .moonlight_preferences
-            .show_input_debug_hud
-            != 0,
-    );
-    install_native_stream_input(&stream_window, moonlight.input.clone())
-        .map_err(moonlight_frontend_error)?;
-    let surface =
-        stream_window_surface_descriptor(&stream_window).map_err(moonlight_frontend_error)?;
-
-    if let Err(error) = moonlight.runtime.attach_surface(surface).await {
-        let _ = close_stream_window(&app);
-        return Err(moonlight_frontend_error(error));
-    }
-
-    if let Ok(mut active_preferences) = moonlight.active_session_preferences.lock() {
-        *active_preferences = Some(prepared.preferences.clone());
-    }
-
-    if let Err(error) = start_runtime_with_connection_repair(
-        context.inner(),
-        moonlight.inner(),
-        &input.host_id,
-        NativeStartRequest {
-            host_id: input.host_id.clone(),
-            app_id: input.app_id,
-            host_address: prepared.host_address.clone(),
-            app_version: prepared.app_version.clone(),
-            gfe_version: prepared.gfe_version.clone(),
-            session_url: prepared.launch_result.rtsp_session_url.clone(),
-            server_codec_mode_support: prepared.server_codec_mode_support,
-            preferences: prepared.preferences.clone(),
-            supported_video_formats: prepared.supported_video_formats,
-            remote_input_key: prepared.remote_input_key,
-            remote_input_iv: prepared.remote_input_iv,
-            session_generation: 0,
-        },
-    )
-    .await
+    #[cfg(target_os = "android")]
     {
-        context.set_stream_network_active(false);
-        let _ = moonlight.runtime.detach_surface().await;
-        if let Ok(mut active_preferences) = moonlight.active_session_preferences.lock() {
-            *active_preferences = None;
-        }
-        let _ = close_stream_window(&app);
-        return Err(error);
-    }
-
-    let state = context.load_state().await;
-    if let Some(instance_id) = resolve_instance_id_for_embedded_host(&state, &input.host_id) {
-        if let Ok(mut active_instance) = moonlight.active_stream_instance_id.lock() {
-            *active_instance = Some(instance_id);
-        }
-        ensure_network_agent_for_stream(context.inner(), instance_id).await;
-    }
-    schedule_microphone_for_game_stream(context.inner(), moonlight.inner(), &input.host_id).await;
-
-    present_stream_window(&stream_window).map_err(moonlight_frontend_error)?;
-    let preferred_capture_mode = match prepared.preferences.input.mouse_mode {
-        crate::moonlight::domain::MouseMode::Relative => CaptureMouseMode::Relative,
-        crate::moonlight::domain::MouseMode::Absolute => CaptureMouseMode::Absolute,
-    };
-    let _ = activate_native_stream_input(&stream_window, preferred_capture_mode);
-    start_network_monitor(&app, prepared.host_address.clone()).await;
-
-    let state = moonlight
-        .runtime
-        .get_state()
+        start_android_stream(
+            &app,
+            context.inner(),
+            moonlight.inner(),
+            &input.host_id,
+            input.app_id,
+            &prepared,
+            true,
+        )
         .await
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        moonlight
+            .input
+            .set_mouse_mode(match prepared.preferences.input.mouse_mode {
+                crate::moonlight::domain::MouseMode::Relative => {
+                    crate::input::state::MouseMode::Relative
+                }
+                crate::moonlight::domain::MouseMode::Absolute => {
+                    crate::input::state::MouseMode::Absolute
+                }
+            });
+        moonlight.input.set_stream_dimensions(
+            prepared.preferences.video.width,
+            prepared.preferences.video.height,
+        );
+
+        let stream_window = create_or_reuse_stream_window(
+            &app,
+            prepared.preferences.video.width,
+            prepared.preferences.video.height,
+            &prepared.host_address,
+        )
         .map_err(moonlight_frontend_error)?;
-    Ok(MoonlightStartStreamResponse {
-        operation: match prepared.launch_result.operation {
-            crate::moonlight::domain::LaunchOperation::Launch => "launch",
-            crate::moonlight::domain::LaunchOperation::Resume => "resume",
+        set_native_stream_input_debug_overlay_enabled(
+            app.state::<AppContext>()
+                .state
+                .read()
+                .await
+                .moonlight_preferences
+                .show_input_debug_hud
+                != 0,
+        );
+        install_native_stream_input(&stream_window, moonlight.input.clone())
+            .map_err(moonlight_frontend_error)?;
+        let surface =
+            stream_window_surface_descriptor(&stream_window).map_err(moonlight_frontend_error)?;
+
+        if let Err(error) = moonlight.runtime.attach_surface(surface).await {
+            let _ = close_stream_window(&app);
+            return Err(moonlight_frontend_error(error));
         }
-        .to_string(),
-        state: session_state_name(&state).to_string(),
-        has_session_url: prepared.launch_result.rtsp_session_url.is_some(),
-    })
+
+        if let Ok(mut active_preferences) = moonlight.active_session_preferences.lock() {
+            *active_preferences = Some(prepared.preferences.clone());
+        }
+
+        if let Err(error) = start_runtime_with_connection_repair(
+            context.inner(),
+            moonlight.inner(),
+            &input.host_id,
+            NativeStartRequest {
+                host_id: input.host_id.clone(),
+                app_id: input.app_id,
+                host_address: prepared.host_address.clone(),
+                app_version: prepared.app_version.clone(),
+                gfe_version: prepared.gfe_version.clone(),
+                session_url: prepared.launch_result.rtsp_session_url.clone(),
+                server_codec_mode_support: prepared.server_codec_mode_support,
+                preferences: prepared.preferences.clone(),
+                supported_video_formats: prepared.supported_video_formats,
+                remote_input_key: prepared.remote_input_key,
+                remote_input_iv: prepared.remote_input_iv,
+                session_generation: 0,
+            },
+        )
+        .await
+        {
+            context.set_stream_network_active(false);
+            let _ = moonlight.runtime.detach_surface().await;
+            if let Ok(mut active_preferences) = moonlight.active_session_preferences.lock() {
+                *active_preferences = None;
+            }
+            let _ = close_stream_window(&app);
+            return Err(error);
+        }
+
+        let state = context.load_state().await;
+        if let Some(instance_id) = resolve_instance_id_for_embedded_host(&state, &input.host_id) {
+            if let Ok(mut active_instance) = moonlight.active_stream_instance_id.lock() {
+                *active_instance = Some(instance_id);
+            }
+            ensure_network_agent_for_stream(context.inner(), instance_id).await;
+        }
+        schedule_microphone_for_game_stream(context.inner(), moonlight.inner(), &input.host_id)
+            .await;
+
+        present_stream_window(&stream_window).map_err(moonlight_frontend_error)?;
+        let preferred_capture_mode = match prepared.preferences.input.mouse_mode {
+            crate::moonlight::domain::MouseMode::Relative => CaptureMouseMode::Relative,
+            crate::moonlight::domain::MouseMode::Absolute => CaptureMouseMode::Absolute,
+        };
+        let _ = activate_native_stream_input(&stream_window, preferred_capture_mode);
+        start_network_monitor(&app, prepared.host_address.clone()).await;
+
+        let state = moonlight
+            .runtime
+            .get_state()
+            .await
+            .map_err(moonlight_frontend_error)?;
+        Ok(MoonlightStartStreamResponse {
+            operation: match prepared.launch_result.operation {
+                crate::moonlight::domain::LaunchOperation::Launch => "launch",
+                crate::moonlight::domain::LaunchOperation::Resume => "resume",
+            }
+            .to_string(),
+            state: session_state_name(&state).to_string(),
+            has_session_url: prepared.launch_result.rtsp_session_url.is_some(),
+        })
+    }
 }
 
 #[tauri::command]
 pub async fn moonlight_present_stream(app: AppHandle) -> Result<(), FrontendError> {
-    let window = app
-        .get_window(crate::moonlight::platform::STREAM_WINDOW_LABEL)
-        .ok_or_else(|| {
-            moonlight_frontend_error(crate::moonlight::domain::MoonlightError::Native(
-                "No stream window is available".into(),
-            ))
-        })?;
-    present_stream_window(&window).map_err(moonlight_frontend_error)
+    #[cfg(target_os = "android")]
+    {
+        let _ = app;
+        android::present_stream()
+            .await
+            .map_err(moonlight_frontend_error)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let window = app
+            .get_window(crate::moonlight::platform::STREAM_WINDOW_LABEL)
+            .ok_or_else(|| {
+                moonlight_frontend_error(crate::moonlight::domain::MoonlightError::Native(
+                    "No stream window is available".into(),
+                ))
+            })?;
+        present_stream_window(&window).map_err(moonlight_frontend_error)
+    }
 }
 
 #[tauri::command]
@@ -5461,46 +5700,107 @@ pub async fn moonlight_disconnect_stream(
     context: State<'_, AppContext>,
     moonlight: State<'_, MoonlightManager>,
 ) -> Result<MoonlightSessionStateResponse, FrontendError> {
-    stop_network_monitor(&app).await;
-    context.set_stream_network_active(false);
-    moonlight
-        .runtime
-        .stop()
-        .await
-        .map_err(moonlight_frontend_error)?;
-    moonlight
-        .runtime
-        .detach_surface()
-        .await
-        .map_err(moonlight_frontend_error)?;
-    moonlight.input.end_capture();
-    if let Ok(mut active_preferences) = moonlight.active_session_preferences.lock() {
-        *active_preferences = None;
-    }
-    close_stream_window(&app).map_err(moonlight_frontend_error)?;
-    let mic_instance_id = moonlight
-        .active_stream_instance_id
-        .lock()
-        .ok()
-        .and_then(|mut instance| instance.take());
-    if let Some(instance_id) = mic_instance_id {
-        let mic_context = context.inner().clone();
-        tauri::async_runtime::spawn(async move {
+    #[cfg(target_os = "android")]
+    {
+        let _bookkeeping = ANDROID_STREAM_BOOKKEEPING.lock().await;
+        let mut first_error = None;
+        // Invalidate startup continuations before the first cleanup await. Do not
+        // await coordinator stop here: it calls this command under its renderer lock.
+        if let Err(error) = close_stream_window(&app) {
+            first_error.get_or_insert_with(|| moonlight_frontend_error(error));
+        }
+        stop_network_monitor(&app).await;
+        context.set_stream_network_active(false);
+        if let Err(error) = moonlight.runtime.stop().await {
+            let error = moonlight_frontend_error(error);
+            first_error.get_or_insert(error);
+        }
+        // The coordinator retains native window references until its detach ACK;
+        // command bookkeeping must still be cleared if this actor operation fails.
+        if let Err(error) = moonlight.runtime.detach_surface().await {
+            let error = moonlight_frontend_error(error);
+            first_error.get_or_insert(error);
+        }
+        moonlight.input.end_capture();
+        if let Ok(mut active_preferences) = moonlight.active_session_preferences.lock() {
+            *active_preferences = None;
+        }
+        if let Err(error) = close_stream_window(&app) {
+            let error = moonlight_frontend_error(error);
+            first_error.get_or_insert(error);
+        }
+        let mic_instance_id = moonlight
+            .active_stream_instance_id
+            .lock()
+            .ok()
+            .and_then(|mut instance| instance.take());
+        if let Some(instance_id) = mic_instance_id {
             if let Err(error) =
-                MicPassthroughService::stop_for_game_stream(&mic_context, instance_id).await
+                MicPassthroughService::stop_for_game_stream(context.inner(), instance_id).await
             {
-                warn!(instance_id, %error, "Microphone stop failed without affecting Moonlight disconnect");
+                warn!(instance_id, %error, "Microphone stop failed during Android Moonlight disconnect");
+                first_error.get_or_insert_with(|| error.into());
             }
-        });
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        let state = moonlight
+            .runtime
+            .get_state()
+            .await
+            .map_err(moonlight_frontend_error)?;
+        Ok(MoonlightSessionStateResponse {
+            state: session_state_name(&state).to_string(),
+        })
     }
-    let state = moonlight
-        .runtime
-        .get_state()
-        .await
-        .map_err(moonlight_frontend_error)?;
-    Ok(MoonlightSessionStateResponse {
-        state: session_state_name(&state).to_string(),
-    })
+    #[cfg(not(target_os = "android"))]
+    {
+        stop_network_monitor(&app).await;
+        context.set_stream_network_active(false);
+        moonlight
+            .runtime
+            .stop()
+            .await
+            .map_err(moonlight_frontend_error)?;
+        moonlight
+            .runtime
+            .detach_surface()
+            .await
+            .map_err(moonlight_frontend_error)?;
+        moonlight.input.end_capture();
+        if let Ok(mut active_preferences) = moonlight.active_session_preferences.lock() {
+            *active_preferences = None;
+        }
+        close_stream_window(&app).map_err(moonlight_frontend_error)?;
+        let mic_instance_id = moonlight
+            .active_stream_instance_id
+            .lock()
+            .ok()
+            .and_then(|mut instance| instance.take());
+        if let Some(instance_id) = mic_instance_id {
+            let mic_context = context.inner().clone();
+            let stop_microphone = async move {
+                if let Err(error) =
+                    MicPassthroughService::stop_for_game_stream(&mic_context, instance_id).await
+                {
+                    warn!(instance_id, %error, "Microphone stop failed without affecting Moonlight disconnect");
+                }
+            };
+            #[cfg(target_os = "android")]
+            stop_microphone.await;
+            #[cfg(not(target_os = "android"))]
+            tauri::async_runtime::spawn(stop_microphone);
+        }
+        let state = moonlight
+            .runtime
+            .get_state()
+            .await
+            .map_err(moonlight_frontend_error)?;
+        Ok(MoonlightSessionStateResponse {
+            state: session_state_name(&state).to_string(),
+        })
+    }
 }
 
 #[derive(Debug, Serialize)]

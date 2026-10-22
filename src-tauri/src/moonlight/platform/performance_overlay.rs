@@ -1,10 +1,8 @@
 use std::sync::{Arc, Mutex};
 use tauri::AppHandle;
-#[cfg(not(target_os = "android"))]
 use tauri::Manager;
 
 use crate::moonlight::domain::MoonlightConfiguration;
-#[cfg(not(target_os = "android"))]
 use crate::moonlight::runtime::RuntimeStatistics;
 
 pub fn preference(
@@ -22,7 +20,6 @@ pub fn preference(
         .unwrap_or(global_default)
 }
 
-#[cfg(not(target_os = "android"))]
 fn number(value: Option<f64>) -> String {
     value
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -45,7 +42,7 @@ pub fn set_preference(configuration: &mut MoonlightConfiguration, host_id: &str,
     }
 }
 
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "android"))]
 fn text(stats: &RuntimeStatistics, probe: Option<&serde_json::Value>) -> String {
     let p = &stats.performance;
     let drops = stats.adaptive_stale_drop_count
@@ -137,8 +134,72 @@ fn text(stats: &RuntimeStatistics, probe: Option<&serde_json::Value>) -> String 
     result
 }
 
+/// One updater and at most one outstanding JNI invocation, regardless of ticks.
 #[cfg(target_os = "android")]
-pub fn start(_app: AppHandle, _enabled: Arc<Mutex<Option<(String, bool)>>>) {}
+pub fn start(app: AppHandle, enabled: Arc<Mutex<Option<(String, bool)>>>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut previous: Option<((i64, i64), String)> = None;
+        loop {
+            tick.tick().await;
+            let Some(route) = super::android::statistics_route() else {
+                if let Some((route, _)) = previous.take() {
+                    let _ = tauri::async_runtime::spawn_blocking(move || {
+                        super::android::clear_statistics(route.0)
+                    })
+                    .await;
+                }
+                // In particular, do not look up Java classes or launch an Activity
+                // every tick while on the dashboard or after a stream has closed.
+                continue;
+            };
+            let visible = enabled
+                .lock()
+                .ok()
+                .is_some_and(|state| state.as_ref().is_some_and(|(_, enabled)| *enabled));
+            let stats = app
+                .state::<crate::moonlight::composition::MoonlightManager>()
+                .runtime
+                .latest_statistics();
+            let content = if visible && stats.state == "streaming" {
+                if stats.sampled_at.elapsed() > std::time::Duration::from_secs(2) {
+                    "NO LAND · Waiting for stream statistics…".into()
+                } else {
+                    let probe = app
+                        .state::<crate::network_monitor::NetworkMonitor>()
+                        .fresh_snapshot()
+                        .await;
+                    text(&stats, probe.as_ref())
+                }
+            } else {
+                String::new()
+            };
+            if previous.as_ref().is_some_and(|(last_route, last_text)| {
+                *last_route == route && *last_text == content
+            }) {
+                continue;
+            }
+            let update = content.clone();
+            match tauri::async_runtime::spawn_blocking(move || {
+                super::android::update_statistics(route, &update)
+            })
+            .await
+            {
+                Ok(Ok(())) => previous = Some((route, content)),
+                failure => {
+                    tracing::warn!(?failure, "Android statistics update failed");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
+    });
+}
 
 /// A single bounded updater for the native window, which has no React webview.
 #[cfg(not(target_os = "android"))]

@@ -11,7 +11,10 @@ endif()
 option(BUILD_NOLAND_MOONLIGHT_HARNESS "Build the standalone native harness" ON)
 option(BUILD_NOLAND_MOONLIGHT_TESTS "Build native tests" ON)
 
-if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build native dependencies as static libraries" FORCE)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS" OR ANDROID)
+  set(CMAKE_POSITION_INDEPENDENT_CODE ON)
   include(FetchContent)
   set(FETCHCONTENT_UPDATES_DISCONNECTED ON)
 
@@ -48,7 +51,6 @@ if(BUILD_NOLAND_MOONLIGHT_TESTS)
   enable_testing()
 endif()
 
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build moonlight-common-c as a static library" FORCE)
 add_subdirectory(moonlight-common-c)
 add_subdirectory(noland-moonlight)
 

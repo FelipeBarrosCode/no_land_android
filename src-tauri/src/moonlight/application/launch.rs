@@ -169,7 +169,9 @@ pub async fn start_stream_request(
 fn default_client_video_capabilities() -> ClientVideoCapabilities {
     ClientVideoCapabilities {
         supports_h264: true,
-        supports_hevc: !cfg!(target_os = "windows"),
+        // Android starts with baseline H.264 until device-specific size/profile
+        // capability probing can guarantee HEVC support before the host launches.
+        supports_hevc: !cfg!(any(target_os = "windows", target_os = "android")),
         supports_av1: false,
         supports_hdr10: false,
         supports_yuv444: false,

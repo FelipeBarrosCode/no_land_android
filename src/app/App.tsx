@@ -21,7 +21,7 @@ import appLogo from "../public/noland.png";
 import { moonlightGetSessionState, refreshStateAgentIndex } from "../lib/backend";
 import { buildDiagnosticIssueUrl } from "../lib/githubIssue";
 import { isRunningInTauri } from "../lib/tauri";
-import { isIOS } from "../lib/platform";
+import { isMobile } from "../lib/platform";
 import { notifyInstancesNeedAttention } from "../lib/instanceNotifications";
 
 import {
@@ -629,7 +629,7 @@ export function App() {
   }, [bindEvents, initialize, windowLabel, windowLabelResolved]);
 
   useEffect(() => {
-    if (isIOS || !isRunningInTauri() || !windowLabelResolved || windowLabel !== "main" || loading) {
+    if (isMobile || !isRunningInTauri() || !windowLabelResolved || windowLabel !== "main" || loading) {
       return;
     }
 
@@ -711,7 +711,7 @@ export function App() {
   ]);
 
   async function quitWindow() {
-    if (isIOS) return;
+    if (isMobile) return;
     setCloseGuardError(null);
     setCloseGuardOpen(false);
     try {
@@ -946,7 +946,7 @@ export function App() {
         </div>
       )}
 
-      {isIOS && embeddedMoonlightStatus?.runtimeConnected && <MobileStreamReturn />}
+      {isMobile && embeddedMoonlightStatus?.runtimeConnected && <MobileStreamReturn />}
 
       <HashRouter>
         <Routes>

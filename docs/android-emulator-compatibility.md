@@ -2,6 +2,8 @@
 
 Audit date: 2026-10-11
 
+> Historical audit: native H.264 streaming, playback audio, touch/basic keyboard input, JNI surface ownership, and WireGuard VPN were subsequently implemented and smoke-tested on a physical ARM64 Pixel 7a on 2026-10-21. See [current Android port status](android-port-status.md). The matrix below records the earlier emulator build, not current source support.
+
 Target used for this audit:
 
 - AVD: `No_Land_API_36`

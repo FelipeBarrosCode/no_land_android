@@ -21,6 +21,10 @@ use crate::errors::{AppError, AppResult};
 
 use super::remote_exec::{ExecOutput, RemoteExec};
 
+#[cfg(target_os = "android")]
+const EMBEDDED_NETWORK_AGENT_SOURCE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/network-agent-source.tar.gz"));
+
 const INSTALL_SCRIPT_TEMPLATE: &str =
     include_str!("../../../network-agent/scripts/install-remote.sh");
 const SYSTEMD_UNIT: &str =
@@ -535,6 +539,11 @@ fn find_network_agent_source_dir() -> AppResult<PathBuf> {
         }
     }
 
+    #[cfg(target_os = "android")]
+    if let Ok(candidate) = materialize_embedded_network_agent_source() {
+        return Ok(candidate);
+    }
+
     let relative_candidates = [
         "network-agent",
         "_up_/network-agent",
@@ -576,6 +585,48 @@ fn find_network_agent_source_dir() -> AppResult<PathBuf> {
         "Could not find the bundled network-agent source directory. Reinstall this app or set NOLAND_NETWORK_AGENT_SOURCE_DIR to a valid source tree."
             .to_string(),
     ))
+}
+
+#[cfg(target_os = "android")]
+fn materialize_embedded_network_agent_source() -> AppResult<PathBuf> {
+    let extraction_root = env::temp_dir().join(format!(
+        "noland-network-agent-source-v{DEPLOYMENT_REVISION}"
+    ));
+    let source_dir = extraction_root.join("network-agent");
+    let contracts_dir = extraction_root.join("network-contracts");
+    if is_network_agent_source_dir(&source_dir)
+        && contracts_dir.join("Cargo.toml").is_file()
+        && contracts_dir.join("src").is_dir()
+    {
+        return Ok(source_dir);
+    }
+
+    fs::remove_dir_all(&extraction_root).ok();
+    fs::create_dir_all(&extraction_root).map_err(|error| {
+        AppError::Provisioning(format!(
+            "Could not create embedded network-agent extraction directory: {error}"
+        ))
+    })?;
+
+    let decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(EMBEDDED_NETWORK_AGENT_SOURCE));
+    tar::Archive::new(decoder)
+        .unpack(&extraction_root)
+        .map_err(|error| {
+            AppError::Provisioning(format!(
+                "Could not extract embedded network-agent source: {error}"
+            ))
+        })?;
+
+    if !is_network_agent_source_dir(&source_dir)
+        || !contracts_dir.join("Cargo.toml").is_file()
+        || !contracts_dir.join("src").is_dir()
+    {
+        return Err(AppError::Provisioning(
+            "Embedded network-agent archive did not contain the required source trees.".to_string(),
+        ));
+    }
+
+    Ok(source_dir)
 }
 
 fn is_network_agent_source_dir(path: &Path) -> bool {

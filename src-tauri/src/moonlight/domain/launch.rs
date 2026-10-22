@@ -94,15 +94,19 @@ pub fn build_launch_parameters(
         ri_key_id: crypto.iv_decimal(),
         audio_configuration: preferences.audio.configuration,
         play_audio_on_host: preferences.audio.play_on_host,
-        // Moonlight iOS always advertises player 1 when on-screen controls are
+        // Mobile clients always advertise player 1 when on-screen controls are
         // available. Several hosts/games don't create a controller correctly
         // when the first gamepad arrives after launch, which breaks both OSC-only
         // play and a physical controller connected later.
-        active_gamepad_mask: if cfg!(target_os = "ios") { 1 } else { 0 },
-        // Moonlight iOS sends gcpersist=1 in its normal single-controller mode.
+        active_gamepad_mask: if cfg!(any(target_os = "ios", target_os = "android")) {
+            1
+        } else {
+            0
+        },
+        // Keep the mobile single-controller slot persistent across reconnects.
         // Keeping player 1 plugged in prevents Steam/Proton games from retaining
         // a stale XInput handle when a stream disconnects and reconnects.
-        persist_gamepads_after_disconnect: cfg!(target_os = "ios")
+        persist_gamepads_after_disconnect: cfg!(any(target_os = "ios", target_os = "android"))
             || preferences.input.persist_controllers_on_disconnect,
         hdr: preferences.video.hdr,
     }

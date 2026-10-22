@@ -48,7 +48,8 @@ typedef enum nl_surface_type {
   NL_SURFACE_MACOS_NSVIEW = 2,
   NL_SURFACE_X11_WINDOW = 3,
   NL_SURFACE_WAYLAND_SURFACE = 4,
-  NL_SURFACE_IOS_UIVIEW = 5
+  NL_SURFACE_IOS_UIVIEW = 5,
+  NL_SURFACE_ANDROID_NATIVE_WINDOW = 6
 } nl_surface_type_t;
 
 typedef enum nl_pacing_mode {
@@ -114,6 +115,8 @@ typedef struct nl_start_request {
 
 typedef struct nl_surface_descriptor {
   nl_surface_type_t surface_type;
+  /* Android: ANativeWindow*, not a jobject Surface. Borrowed by the renderer;
+   * the caller must retain a valid reference until detach returns. */
   void* window_handle;
   void* display_handle;
   uint32_t width;

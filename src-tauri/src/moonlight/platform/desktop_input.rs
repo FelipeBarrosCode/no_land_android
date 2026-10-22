@@ -180,9 +180,7 @@ pub fn install_native_stream_input<R: Runtime>(
     #[cfg(target_os = "android")]
     {
         let _ = window;
-        Err(MoonlightError::Native(
-            "Android native stream input is not connected yet".into(),
-        ))
+        super::android::install_input(&input)
     }
     #[cfg(not(target_os = "android"))]
     Ok(())
@@ -207,6 +205,7 @@ pub fn uninstall_native_stream_input<R: Runtime>(window: &Window<R>) -> Result<(
     #[cfg(target_os = "android")]
     {
         let _ = window;
+        super::android::uninstall_input();
     }
 
     Ok(())
@@ -250,7 +249,7 @@ pub fn activate_native_stream_input<R: Runtime>(
     #[cfg(target_os = "android")]
     {
         let _ = (window, mode);
-        Ok(false)
+        super::android::activate_input()
     }
 }
 
@@ -288,7 +287,8 @@ pub fn deactivate_native_stream_input<R: Runtime>(
     #[cfg(target_os = "android")]
     {
         let _ = window;
-        Ok(false)
+        super::android::release_input();
+        Ok(true)
     }
 }
 

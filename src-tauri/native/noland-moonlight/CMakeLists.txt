@@ -15,7 +15,7 @@ add_library(noland_moonlight STATIC
   src/noland_frame_deadline_policy.c
 )
 
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS" AND NOT ANDROID)
   find_path(SDL2_INCLUDE_ROOT SDL2/SDL.h HINTS ${NOLAND_NATIVE_INCLUDE_HINTS} REQUIRED)
   find_library(SDL2_LIBRARY NAMES SDL2 SDL2-static HINTS ${NOLAND_NATIVE_LIB_HINTS} REQUIRED)
   target_include_directories(noland_moonlight PRIVATE ${SDL2_INCLUDE_ROOT} ${SDL2_INCLUDE_ROOT}/SDL2)
@@ -31,6 +31,17 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     src/noland_microphone_ios.m
     src/noland_input_ios.c
   )
+elseif(ANDROID)
+  target_compile_definitions(noland_moonlight PRIVATE NOLAND_ANDROID_RENDERER)
+  target_sources(noland_moonlight PRIVATE
+    src/noland_video_renderer_android.c
+    src/noland_audio_renderer_android.c
+  )
+  # Android input may be supplied by the Java/JNI bridge instead.
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/noland_input_android.c")
+    target_sources(noland_moonlight PRIVATE src/noland_input_android.c)
+  endif()
+  target_link_libraries(noland_moonlight PRIVATE android log mediandk OpenSLES m)
 elseif(APPLE)
   target_sources(noland_moonlight PRIVATE src/noland_video_renderer_macos.m src/noland_audio_renderer_macos.m)
 elseif(UNIX)
@@ -54,7 +65,7 @@ elseif(WIN32)
   target_link_libraries(noland_moonlight PRIVATE d3d11 dxgi mf mfplat mfuuid ole32 user32 gdi32)
 endif()
 
-if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS" OR ANDROID)
   set(OPUS_INCLUDE_DIR "${opus_SOURCE_DIR}/include")
   set(OPUS_LIBRARY_TARGET opus)
 else()
@@ -62,7 +73,7 @@ else()
   find_library(OPUS_LIBRARY opus HINTS ${NOLAND_NATIVE_LIB_HINTS})
 endif()
 
-if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS" OR ANDROID)
   # The source-built target is linked below.
 elseif(WIN32)
   if(OPUS_INCLUDE_DIR AND OPUS_LIBRARY)
@@ -104,7 +115,7 @@ target_include_directories(noland_moonlight
 
 target_compile_features(noland_moonlight PRIVATE c_std_11)
 set_target_properties(noland_moonlight PROPERTIES POSITION_INDEPENDENT_CODE ON)
-if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS" OR ANDROID)
   target_link_libraries(noland_moonlight PRIVATE moonlight-common-c ${OPUS_LIBRARY_TARGET})
 elseif(WIN32)
   target_link_libraries(noland_moonlight PRIVATE moonlight-common-c ${OPUS_LIBRARY_TARGET})

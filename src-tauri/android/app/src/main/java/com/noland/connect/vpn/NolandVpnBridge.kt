@@ -1,7 +1,6 @@
 package com.noland.connect.vpn
 
 import android.content.Context
-import android.content.Intent
 import android.net.VpnService
 import androidx.annotation.Keep
 import com.wireguard.android.backend.BackendException
@@ -272,14 +271,16 @@ object NolandVpnBridge {
   }
 
   private fun permissionRequired(context: Context, reference: String): JSONObject? {
-    val intent = VpnService.prepare(context) ?: return null
-    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-    context.startActivity(intent)
+    if (VpnService.prepare(context) == null) return null
+
+    val result = VpnPermissionActivity.request(context)
+    if (result.granted && VpnService.prepare(context) == null) return null
+
     return statusResponse(
       false,
-      "permission_required",
+      if (result.granted) "permission_required" else "permission_denied",
       reference,
-      "VPN permission is required; an authorization request was launched.",
+      result.error ?: "VPN permission is required. Approve the Android connection request to continue.",
     )
   }
 

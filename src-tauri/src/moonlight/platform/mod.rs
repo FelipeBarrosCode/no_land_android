@@ -1,3 +1,5 @@
+#[cfg(target_os = "android")]
+pub mod android;
 pub mod desktop_input;
 pub mod performance_overlay;
 pub mod window;

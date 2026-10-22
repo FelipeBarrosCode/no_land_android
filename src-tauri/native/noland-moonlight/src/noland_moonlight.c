@@ -1301,7 +1301,7 @@ nl_result_t nl_runtime_read_stats(nl_runtime_t* runtime, nl_stats_t* output) {
         }
         for (key = 0; key < 16; key++) {
           if ((runtime->active_gamepad_mask & (1U << key)) != 0U) {
-#ifdef NOLAND_IOS_RENDERER
+#if defined(NOLAND_IOS_RENDERER) || defined(__ANDROID__)
             // Menu/focus changes release buttons, not devices. A zero mask is a
             // host-side disconnect and invalidates controller arrival state.
             (void)LiSendMultiControllerEvent((short)key, (short)runtime->active_gamepad_mask, 0, 0, 0, 0, 0, 0, 0);
@@ -1314,7 +1314,7 @@ nl_result_t nl_runtime_read_stats(nl_runtime_t* runtime, nl_stats_t* output) {
       }
       memset(runtime->pressed_mouse_buttons, 0, sizeof(runtime->pressed_mouse_buttons));
       memset(runtime->pressed_keys, 0, sizeof(runtime->pressed_keys));
-#ifndef NOLAND_IOS_RENDERER
+#if !defined(NOLAND_IOS_RENDERER) && !defined(__ANDROID__)
       runtime->active_gamepad_mask = 0;
 #endif
       return NL_RESULT_OK;

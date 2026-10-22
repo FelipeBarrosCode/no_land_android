@@ -13,6 +13,10 @@ use crate::errors::{AppError, AppResult};
 
 use super::remote_exec::RemoteExec;
 
+#[cfg(target_os = "android")]
+const EMBEDDED_MIC_RECEIVER_SOURCE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mic-receiver-source.tar.gz"));
+
 const INSTALL_SCRIPT: &str = include_str!("../../scripts/install_cloud_mic_agent.sh");
 
 pub struct MicReceiverProvisioner;
@@ -235,6 +239,11 @@ fn find_receiver_source_dir() -> AppResult<PathBuf> {
         }
     }
 
+    #[cfg(target_os = "android")]
+    if let Ok(candidate) = materialize_embedded_receiver_source() {
+        return Ok(candidate);
+    }
+
     let direct_relative_dirs = [
         "vm-cloud-mic-agent",
         "resources/vm-cloud-mic-agent",
@@ -270,6 +279,40 @@ fn find_receiver_source_dir() -> AppResult<PathBuf> {
         "Could not find bundled vm-cloud-mic-agent source directory. Reinstall this app or set NOLAND_MIC_RECEIVER_SOURCE_DIR to a valid source tree."
             .to_string(),
     ))
+}
+
+#[cfg(target_os = "android")]
+fn materialize_embedded_receiver_source() -> AppResult<PathBuf> {
+    let extraction_root = env::temp_dir().join("noland-mic-receiver-source-v1");
+    let source_dir = extraction_root.join("vm-cloud-mic-agent");
+    if is_receiver_source_dir(&source_dir) {
+        return Ok(source_dir);
+    }
+
+    fs::remove_dir_all(&extraction_root).ok();
+    fs::create_dir_all(&extraction_root).map_err(|error| {
+        AppError::Command(format!(
+            "Failed creating embedded microphone receiver extraction directory: {error}"
+        ))
+    })?;
+
+    let decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(EMBEDDED_MIC_RECEIVER_SOURCE));
+    tar::Archive::new(decoder)
+        .unpack(&extraction_root)
+        .map_err(|error| {
+            AppError::Command(format!(
+                "Failed extracting embedded microphone receiver source: {error}"
+            ))
+        })?;
+
+    if !is_receiver_source_dir(&source_dir) {
+        return Err(AppError::NotFound(
+            "Embedded microphone receiver archive did not contain the required source tree."
+                .to_string(),
+        ));
+    }
+
+    Ok(source_dir)
 }
 
 fn find_named_dir_recursively(root: &Path, wanted: &str, max_depth: usize) -> Option<PathBuf> {

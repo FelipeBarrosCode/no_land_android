@@ -88,6 +88,10 @@ pub enum RuntimeCommand {
         modifiers: u8,
         response: oneshot::Sender<Result<(), MoonlightError>>,
     },
+    SendUtf8Text {
+        text: String,
+        response: oneshot::Sender<Result<(), MoonlightError>>,
+    },
     SendControllerArrival {
         controller_number: u8,
         active_gamepad_mask: u16,
@@ -395,6 +399,18 @@ impl MoonlightRuntimeHandle {
             .map_err(|_| MoonlightError::Persistence("runtime actor is unavailable".to_string()))?;
         rx.await.map_err(|_| {
             MoonlightError::Persistence("runtime actor dropped keyboard response".to_string())
+        })?
+    }
+
+    /// Serialized text injection; callers use normal virtual keys for ASCII.
+    pub async fn send_utf8_text(&self, text: String) -> Result<(), MoonlightError> {
+        let (tx, rx) = oneshot::channel();
+        self.commands
+            .send(RuntimeCommand::SendUtf8Text { text, response: tx })
+            .await
+            .map_err(|_| MoonlightError::Persistence("runtime actor is unavailable".to_string()))?;
+        rx.await.map_err(|_| {
+            MoonlightError::Persistence("runtime actor dropped UTF-8 text response".to_string())
         })?
     }
 
@@ -747,6 +763,17 @@ impl NativeRuntime {
     ) -> Result<(), MoonlightError> {
         let result = unsafe { native::nl_send_keyboard(self.raw, virtual_key, pressed, modifiers) };
         map_native_result(result, "nl_send_keyboard")
+    }
+
+    fn send_utf8_text(&mut self, text: &str) -> Result<(), MoonlightError> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let length = u32::try_from(text.len())
+            .map_err(|_| MoonlightError::Native("UTF-8 input exceeds protocol length".into()))?;
+        // The native API takes a byte length, not a NUL-terminated C string.
+        let result = unsafe { native::nl_send_utf8_text(self.raw, text.as_ptr().cast(), length) };
+        map_native_result(result, "nl_send_utf8_text")
     }
 
     fn send_controller_arrival(
@@ -2141,6 +2168,10 @@ pub fn spawn_runtime_actor(app_data_dir: PathBuf) -> MoonlightRuntimeHandle {
                         }
                         RuntimeCommand::SendKeyboard { virtual_key, pressed, modifiers, response } => {
                             let result = native_runtime.send_keyboard(virtual_key, pressed, modifiers);
+                            let _ = response.send(result);
+                        }
+                        RuntimeCommand::SendUtf8Text { text, response } => {
+                            let result = native_runtime.send_utf8_text(&text);
                             let _ = response.send(result);
                         }
                         RuntimeCommand::SendControllerArrival {

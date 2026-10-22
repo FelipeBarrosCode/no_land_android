@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { Button } from "../../components/ui/Button";
 import {
@@ -8,72 +8,86 @@ import {
   moonlightSendClipboardToRemote,
 } from "../../lib/backend";
 import { translate, translateSource } from "../../lib/i18n";
+import { isAndroid } from "../../lib/platform";
+
+type Action = "return" | "send" | "get" | "disconnect";
+type Statistics = { renderedFpsX100: number; averageDecodePipelineUs: number };
+
+function failureMessage(failure: unknown): string {
+  if (failure && typeof failure === "object") {
+    const details = failure as { details?: unknown; message?: unknown };
+    if (typeof details.details === "string") return details.details;
+    if (typeof details.message === "string") return details.message;
+  }
+  return String(failure);
+}
 
 export function MobileStreamReturn() {
   const [error, setError] = useState<string | null>(null);
-  const [pending, setPending] = useState(false);
-  const [action, setAction] = useState<"send" | "get" | "disconnect" | null>(null);
+  const [action, setAction] = useState<Action | null>(null);
   const [status, setStatus] = useState<string | null>(null);
-  const [streamStats, setStreamStats] = useState<{ renderedFpsX100: number; averageDecodePipelineUs: number } | null>(null);
+  const [streamStats, setStreamStats] = useState<Statistics | null>(null);
+  const mounted = useRef(false);
+  const busy = useRef(false);
 
   useEffect(() => {
-    const unlisten = listen<{ renderedFpsX100: number; averageDecodePipelineUs: number }>(
-      "moonlight://statistics",
-      ({ payload }) => setStreamStats(payload),
-    );
-    return () => { void unlisten.then((dispose) => dispose()); };
+    mounted.current = true;
+    let active = true;
+    let dispose: (() => void) | undefined;
+    void listen<Statistics>("moonlight://statistics", ({ payload }) => {
+      if (active) setStreamStats(payload);
+    }).then((unlisten) => {
+      if (active) dispose = unlisten;
+      else unlisten();
+    }).catch((failure) => {
+      if (active) setError(failureMessage(failure));
+    });
+    return () => {
+      active = false;
+      mounted.current = false;
+      dispose?.();
+    };
   }, []);
-  async function returnToStream() {
-    setPending(true);
+
+  async function perform(next: Action) {
+    if (busy.current) return;
+    busy.current = true;
+    setAction(next);
     setError(null);
     try {
-      await moonlightPresentStream();
+      if (next === "return") await moonlightPresentStream();
+      else if (next === "disconnect") await moonlightDisconnectStream();
+      else {
+        const result = next === "send"
+          ? await moonlightSendClipboardToRemote()
+          : await moonlightGetClipboardFromRemote();
+        if (mounted.current) setStatus(translate(next === "send" ? "stream.clipboard.sent" : "stream.clipboard.received", {
+          count: result.byteCount,
+        }));
+      }
     } catch (failure) {
-      const details = failure as { message?: string; details?: string };
-      setError(details?.details || details?.message || String(failure));
+      if (mounted.current) setError(failureMessage(failure));
     } finally {
-      setPending(false);
+      busy.current = false;
+      if (mounted.current) setAction(null);
     }
   }
-  async function clipboard(direction: "send" | "get") {
-    setAction(direction);
-    setError(null);
-    try {
-      const result = direction === "send"
-        ? await moonlightSendClipboardToRemote()
-        : await moonlightGetClipboardFromRemote();
-      setStatus(translate(direction === "send" ? "stream.clipboard.sent" : "stream.clipboard.received", {
-        count: result.byteCount,
-      }));
-    } catch (failure) {
-      setError(failure instanceof Error ? failure.message : String(failure));
-    } finally {
-      setAction(null);
-    }
-  }
-  async function disconnect() {
-    setAction("disconnect");
-    setError(null);
-    try {
-      await moonlightDisconnectStream();
-    } catch (failure) {
-      setError(failure instanceof Error ? failure.message : String(failure));
-      setAction(null);
-    }
-  }
+
   return (
     <div className="sticky top-0 z-40 border-b border-[#3e4270] bg-[#10122af2] p-3 backdrop-blur">
       <div className="flex flex-wrap gap-2">
-        <Button onClick={() => void returnToStream()} disabled={pending || action !== null}>
+        <Button onClick={() => void perform("return")} disabled={action !== null}>
           {translate("mobile.returnToStream")}
         </Button>
-        <Button variant="ghost" onClick={() => void clipboard("send")} disabled={action !== null}>
-          {translate("generated.639d984d9ffc0361")}
-        </Button>
-        <Button variant="ghost" onClick={() => void clipboard("get")} disabled={action !== null}>
-          {translate("generated.9d060e4dd135b141")}
-        </Button>
-        <Button variant="danger" onClick={() => void disconnect()} disabled={action !== null}>
+        {!isAndroid && <>
+          <Button variant="ghost" onClick={() => void perform("send")} disabled={action !== null}>
+            {translate("generated.639d984d9ffc0361")}
+          </Button>
+          <Button variant="ghost" onClick={() => void perform("get")} disabled={action !== null}>
+            {translate("generated.9d060e4dd135b141")}
+          </Button>
+        </>}
+        <Button variant="danger" onClick={() => void perform("disconnect")} disabled={action !== null}>
           {action === "disconnect" ? translate("generated.6feadc6d3b71fbcc") : translate("generated.23c13af33709b5e3")}
         </Button>
       </div>

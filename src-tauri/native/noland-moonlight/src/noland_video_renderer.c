@@ -3,6 +3,7 @@
 
 #include <string.h>
 
+#if !defined(__APPLE__) && !defined(__linux__) && !defined(__ANDROID__) && !defined(_WIN32)
 static void nl_video_renderer_platform_attach_surface_noop(nl_video_renderer_t* renderer, const nl_surface_descriptor_t* surface) {
   (void)renderer;
   (void)surface;
@@ -39,15 +40,16 @@ static int nl_video_renderer_platform_submit_frame_noop(nl_video_renderer_t* ren
   (void)frame;
   return DR_OK;
 }
+#endif
 
-#if !defined(__linux__) && !defined(NOLAND_IOS_RENDERER)
+#if !defined(__linux__) && !defined(__ANDROID__) && !defined(NOLAND_IOS_RENDERER)
 void nl_video_renderer_platform_set_overlay_text(nl_video_renderer_t* renderer, const char* text) {
   (void)renderer;
   (void)text;
 }
 #endif
 
-#if !defined(__APPLE__) && !defined(__linux__) && !defined(_WIN32)
+#if !defined(__APPLE__) && !defined(__linux__) && !defined(__ANDROID__) && !defined(_WIN32)
 void nl_video_renderer_platform_attach_surface(nl_video_renderer_t* renderer, const nl_surface_descriptor_t* surface) {
   nl_video_renderer_platform_attach_surface_noop(renderer, surface);
 }
@@ -237,6 +239,10 @@ int nl_video_renderer_submit_frame(nl_video_renderer_t* renderer, const void* de
     return -1;
   }
 
+  // Android synchronizes readiness with codec/surface changes in its backend.
+  // In particular, a detached surface must request IDR rather than acknowledge
+  // a frame that never reached the decoder.
+#if !defined(__ANDROID__)
   if (!nl_video_renderer_is_ready(renderer)) {
     renderer->dropped_frame_count += 1U;
     nl_latency_telemetry_record_drop(
@@ -246,6 +252,7 @@ int nl_video_renderer_submit_frame(nl_video_renderer_t* renderer, const void* de
         NL_FRAME_DROP_RENDERER_ERROR);
     return DR_OK;
   }
+#endif
 
   renderer->last_frame = *frame;
   result = nl_video_renderer_platform_submit_frame(renderer, decode_unit, frame);
