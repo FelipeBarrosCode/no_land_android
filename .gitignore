@@ -94,6 +94,9 @@ src-tauri/platform/*
 !/.agent-deploy/
 !/.tmp-agent-deploy/
 !/.tmp/
+# Local Android linker reproductions and validation build caches
+/.tmp/android-link-repro/
+/.tmp/android-validation-target/
 /agent/
 /data/
 /skills/
