@@ -4,6 +4,8 @@
 
 ### Turn on-demand GPU cloud machines into personal remote gaming PCs.
 
+[![Android build](https://img.shields.io/github/v/release/FelipeBarrosCode/no_land_android?include_prereleases&filter=android-v*&sort=date&label=Android%20build)](https://github.com/FelipeBarrosCode/no_land_android/releases?q=android-v&expanded=true)
+
 [![Rust](https://img.shields.io/badge/Rust-Tauri-000000?logo=rust)](https://www.rust-lang.org/)
 [![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white)](https://tauri.app/)
 [![React](https://img.shields.io/badge/React-TypeScript-20232a?logo=react)](https://react.dev/)
@@ -17,6 +19,18 @@
 </div>
 
 ---
+
+## Download the current Android build
+
+The **Android build** badge above shows the newest published Android release tag, including preview builds. It updates automatically from GitHub Releases, independently of the source version in `package.json`.
+
+[Download APKs and SHA-256 checksums](https://github.com/FelipeBarrosCode/no_land_android/releases?q=android-v&expanded=true). Preview builds provide debug APKs for **arm64** (most Android devices) and **x86_64**.
+
+You can also inspect available builds with the GitHub CLI:
+
+```sh
+gh release list --repo FelipeBarrosCode/no_land_android --exclude-drafts
+```
 
 ## Why No Land exists
 

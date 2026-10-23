@@ -92,6 +92,23 @@ jobs:
             "build-tools;${ANDROID_BUILD_TOOLS}" \
             "ndk;${ANDROID_NDK_VERSION}" \
             "cmake;${ANDROID_CMAKE_VERSION}"
+      - name: Select the pinned Android native toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          ndk="${ANDROID_HOME}/ndk/${ANDROID_NDK_VERSION}"
+          cmake_bin="${ANDROID_HOME}/cmake/${ANDROID_CMAKE_VERSION}/bin"
+          test -f "${ndk}/build/cmake/android.toolchain.cmake"
+          test -x "${cmake_bin}/cmake"
+          test -x "${cmake_bin}/ninja"
+          {
+            echo "NDK_HOME=${ndk}"
+            echo "ANDROID_NDK_HOME=${ndk}"
+            echo "CMAKE=${cmake_bin}/cmake"
+          } >> "$GITHUB_ENV"
+          echo "$cmake_bin" >> "$GITHUB_PATH"
+          cat "${ndk}/source.properties"
+          "${cmake_bin}/cmake" --version
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust_target }}

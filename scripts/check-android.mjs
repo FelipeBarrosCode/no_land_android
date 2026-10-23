@@ -41,6 +41,24 @@ const configureScript = existsSync(configureScriptPath)
   : "";
 const gitignore = readFileSync(join(root, ".gitignore"), "utf8");
 const tauriBuildScript = readFileSync(join(root, "src-tauri", "build.rs"), "utf8");
+const androidWorkflow = readFileSync(join(root, ".github", "workflows", "android.yml"), "utf8");
+check(
+  androidWorkflow.includes('ndk="${ANDROID_HOME}/ndk/${ANDROID_NDK_VERSION}"') &&
+    androidWorkflow.includes('cmake_bin="${ANDROID_HOME}/cmake/${ANDROID_CMAKE_VERSION}/bin"') &&
+    androidWorkflow.includes('echo "NDK_HOME=${ndk}"') &&
+    androidWorkflow.includes('echo "ANDROID_NDK_HOME=${ndk}"') &&
+    androidWorkflow.includes('echo "CMAKE=${cmake_bin}/cmake"') &&
+    androidWorkflow.includes('>> "$GITHUB_ENV"') &&
+    androidWorkflow.includes('echo "$cmake_bin" >> "$GITHUB_PATH"'),
+  "Android CI selects the installed pinned NDK and CMake for Tauri and native builds",
+);
+check(
+  tauriBuildScript.includes('native_env("ANDROID_PLATFORM")') &&
+    tauriBuildScript.includes('native_env("NDK_API_LEVEL")') &&
+    tauriBuildScript.includes('"android-24".into()') &&
+    !tauriBuildScript.includes('native_env("ANDROID_API_LEVEL")'),
+  "Android native minimum API is independent of the installed compile SDK level",
+);
 const stateAgentRuntime = readFileSync(
   join(root, "src-tauri", "src", "services", "shared_storage", "agent_runtime.rs"),
   "utf8",

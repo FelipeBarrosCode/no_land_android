@@ -171,8 +171,8 @@ fn configure_android_cmake(config: &mut cmake::Config, target: &str) {
             .generator("Ninja")
             .define("CMAKE_MAKE_PROGRAM", ninja);
     }
+    // The installed/compile SDK level is not the minimum native runtime API.
     let platform = native_env("ANDROID_PLATFORM")
-        .or_else(|| native_env("ANDROID_API_LEVEL"))
         .or_else(|| native_env("NDK_API_LEVEL"))
         .unwrap_or_else(|| "android-24".into());
     config
