@@ -101,6 +101,13 @@ jobs:
           test -f "${ndk}/build/cmake/android.toolchain.cmake"
           test -x "${cmake_bin}/cmake"
           test -x "${cmake_bin}/ninja"
+          # Tauri 2.10.1 ignores NDK_HOME and selects the last SDK/ndk entry.
+          # Keep other runner-provided NDKs outside that discovery directory.
+          unused_ndks="${RUNNER_TEMP}/noland-unused-ndks"
+          mkdir -p "$unused_ndks"
+          find "${ANDROID_HOME}/ndk" -mindepth 1 -maxdepth 1 \
+            ! -name "${ANDROID_NDK_VERSION}" \
+            -exec mv -- {} "$unused_ndks/" \;
           {
             echo "NDK_HOME=${ndk}"
             echo "ANDROID_NDK_HOME=${ndk}"
@@ -116,12 +123,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-          key: android-${{ matrix.abi }}
+          key: android-${{ matrix.abi }}-ndk-${{ env.ANDROID_NDK_VERSION }}-cmake-${{ env.ANDROID_CMAKE_VERSION }}
       - name: Install JavaScript dependencies
         run: npm ci
       - name: Validate Android source and shared frontend
         run: |
           npm run check:android
+          node --test scripts/android-toolchain.test.mjs
           npm run i18n:check
           npm run build
           cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check

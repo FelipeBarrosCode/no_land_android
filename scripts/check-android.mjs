@@ -53,6 +53,15 @@ check(
   "Android CI selects the installed pinned NDK and CMake for Tauri and native builds",
 );
 check(
+  androidWorkflow.includes('unused_ndks="${RUNNER_TEMP}/noland-unused-ndks"') &&
+    androidWorkflow.includes('find "${ANDROID_HOME}/ndk" -mindepth 1 -maxdepth 1') &&
+    androidWorkflow.includes('! -name "${ANDROID_NDK_VERSION}"') &&
+    androidWorkflow.includes('-exec mv -- {} "$unused_ndks/" \\;') &&
+    androidWorkflow.indexOf('unused_ndks=') < androidWorkflow.indexOf('run: npm run tauri:android:init') &&
+    androidWorkflow.includes('key: android-${{ matrix.abi }}-ndk-${{ env.ANDROID_NDK_VERSION }}-cmake-${{ env.ANDROID_CMAKE_VERSION }}'),
+  "Android CI isolates the pinned NDK from Tauri auto-discovery and separates toolchain build caches",
+);
+check(
   tauriBuildScript.includes('native_env("ANDROID_PLATFORM")') &&
     tauriBuildScript.includes('native_env("NDK_API_LEVEL")') &&
     tauriBuildScript.includes('"android-24".into()') &&
