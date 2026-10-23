@@ -185,6 +185,43 @@ fn configure_android_cmake(config: &mut cmake::Config, target: &str) {
         .build_target("noland_moonlight");
 }
 
+fn link_android_compiler_runtime(target: &str) {
+    // Rust uses -nodefaultlibs, so Clang does not automatically supply the CPU
+    // detection state required by Moonlight's x86 __builtin_cpu_supports calls.
+    let compiler = cc::Build::new().target(target).get_compiler();
+    let output = compiler
+        .to_command()
+        .arg("--print-libgcc-file-name")
+        .output()
+        .expect("failed to query the Android compiler runtime archive");
+    assert!(
+        output.status.success(),
+        "Android compiler runtime query failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let archive = PathBuf::from(
+        String::from_utf8(output.stdout)
+            .expect("Android compiler runtime path is not UTF-8")
+            .trim(),
+    );
+    assert!(
+        archive.is_file(),
+        "Android compiler runtime archive does not exist: {}",
+        archive.display()
+    );
+    let library = archive
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("lib"))
+        .and_then(|name| name.strip_suffix(".a"))
+        .expect("Android compiler runtime must be a static lib*.a archive");
+    println!(
+        "cargo:rustc-link-search=native={}",
+        archive.parent().unwrap().display()
+    );
+    println!("cargo:rustc-link-lib=static={library}");
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=NOLAND_SKIP_APP_BUILD_RS");
     println!("cargo:rerun-if-env-changed=NOLAND_SKIP_NATIVE_BUILD");
@@ -512,6 +549,12 @@ fn main() {
         println!("cargo:rustc-link-lib=static=mbedcrypto");
     }
     if is_android {
+        if matches!(
+            target.as_str(),
+            "x86_64-linux-android" | "i686-linux-android"
+        ) {
+            link_android_compiler_runtime(&target);
+        }
         for library in ["android", "log", "mediandk", "OpenSLES", "m"] {
             println!("cargo:rustc-link-lib={library}");
         }

@@ -68,6 +68,13 @@ check(
     !tauriBuildScript.includes('native_env("ANDROID_API_LEVEL")'),
   "Android native minimum API is independent of the installed compile SDK level",
 );
+check(
+  tauriBuildScript.includes("fn link_android_compiler_runtime(target: &str)") &&
+    tauriBuildScript.includes('arg("--print-libgcc-file-name")') &&
+    tauriBuildScript.includes("link_android_compiler_runtime(&target);") &&
+    androidWorkflow.includes("node scripts/check-android-native-link.mjs ${{ matrix.target }}"),
+  "Android x86 links its compiler runtime and CI checks Rust-style native linkage",
+);
 const stateAgentRuntime = readFileSync(
   join(root, "src-tauri", "src", "services", "shared_storage", "agent_runtime.rs"),
   "utf8",

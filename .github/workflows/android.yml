@@ -133,6 +133,8 @@ jobs:
           npm run i18n:check
           npm run build
           cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check
+      - name: Check Android native CPU-dispatch linkage
+        run: node scripts/check-android-native-link.mjs ${{ matrix.target }}
       - name: Generate the Tauri Android project
         run: npm run tauri:android:init
       - name: Build ${{ matrix.abi }} debug APK
