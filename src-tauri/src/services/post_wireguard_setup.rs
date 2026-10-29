@@ -516,6 +516,30 @@ async fn finish_wireguard_verification(
     Ok(result)
 }
 
+async fn ensure_sunshine_credentials(
+    context: &AppContext,
+    username: &str,
+    password: &str,
+) -> AppResult<()> {
+    if username.trim().is_empty() || password.trim().is_empty() {
+        set_setup_failure(
+            context,
+            SetupStage::SunshineCredentialsConfiguring,
+            OrchestrationState::SunshineCredentialsConfiguring,
+            "missing_platform_credentials",
+            "Sunshine setup requires an app username and password from protected settings.",
+            Some("Set platform credentials in onboarding/settings, then retry.".to_string()),
+            true,
+        )
+        .await?;
+        return Err(AppError::InvalidInput(
+            "Sunshine setup requires an app username/password from protected settings.".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 pub async fn verify_sunshine_api(
     app: &AppHandle,
     context: &AppContext,
@@ -559,21 +583,7 @@ pub async fn verify_sunshine_api(
         )
     };
 
-    if username.trim().is_empty() || password.trim().is_empty() {
-        set_setup_failure(
-            context,
-            SetupStage::SunshineCredentialsConfiguring,
-            OrchestrationState::SunshineCredentialsConfiguring,
-            "missing_platform_credentials",
-            "Sunshine setup requires an app username and password from protected settings.",
-            Some("Set platform credentials in onboarding/settings, then retry.".to_string()),
-            true,
-        )
-        .await?;
-        return Err(AppError::InvalidInput(
-            "Sunshine setup requires an app username/password from protected settings.".to_string(),
-        ));
-    }
+    ensure_sunshine_credentials(context, &username, &password).await?;
 
     let client = sunshine_http_client()?;
     let config_path = active_wireguard_config_path(context).await?;
@@ -1267,6 +1277,8 @@ async fn repair_sunshine_auth_state(
     sunshine_password: &str,
     best_effort: bool,
 ) -> AppResult<()> {
+    ensure_sunshine_credentials(context, sunshine_username, sunshine_password).await?;
+
     emit_post_wireguard_event(
         app,
         context,
