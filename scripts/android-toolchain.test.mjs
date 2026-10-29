@@ -4,6 +4,11 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import {
+  DESUGAR_DEPENDENCY,
+  injectWireGuardDependency,
+  WIREGUARD_DEPENDENCY,
+} from "./configure-android-project.mjs";
 
 const workflow = readFileSync(new URL("../.github/workflows/android.yml", import.meta.url), "utf8");
 const step = workflow.split("      - name: Select the pinned Android native toolchain\n")[1]?.split("      - uses:")[0];
@@ -50,6 +55,176 @@ function fixture(t, { pinned = true } = {}) {
   });
   return { sdk, ndks, version, cmake, runnerTemp, envFile, pathFile, run };
 }
+
+// Rendered from the CLI 2.12.4 app template (no optional plugins/dependencies):
+// https://github.com/tauri-apps/tauri/blob/tauri-cli-v2.12.4/crates/tauri-cli/templates/mobile/android/app/build.gradle.kts
+const cli2124Gradle = `import java.util.Properties
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("rust")
+}
+
+val tauriProperties = Properties().apply {
+    val propFile = file("tauri.properties")
+    if (propFile.exists()) {
+        propFile.inputStream().use { load(it) }
+    }
+}
+
+android {
+    compileSdk = 37
+    namespace = "com.example.app"
+    defaultConfig {
+        manifestPlaceholders["usesCleartextTraffic"] = "false"
+        applicationId = "com.example.app"
+        minSdk = 24
+        targetSdk = 37
+        versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
+        versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
+    }
+    buildTypes {
+        getByName("debug") {
+            manifestPlaceholders["usesCleartextTraffic"] = "true"
+            isDebuggable = true
+            isJniDebuggable = true
+            isMinifyEnabled = false
+            packaging {
+                jniLibs.keepDebugSymbols.add("*/arm64-v8a/*.so")
+                jniLibs.keepDebugSymbols.add("*/x86_64/*.so")
+            }
+        }
+        getByName("release") {
+            optimization {
+               enable = true
+            }
+            proguardFiles(
+                *fileTree(".") {
+                  include("**/*.pro")
+                  exclude("build/**")
+                }.files.toTypedArray()
+            )
+        }
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_1_8
+        targetCompatibility = JavaVersion.VERSION_1_8
+    }
+    buildFeatures {
+        buildConfig = true
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget = JvmTarget.JVM_1_8
+    }
+}
+
+rust {
+    rootDirRel = "../../../"
+}
+
+dependencies {
+    implementation("androidx.webkit:webkit:1.14.0")
+    implementation("androidx.appcompat:appcompat:1.7.1")
+    implementation("androidx.activity:activity-ktx:1.10.1")
+    implementation("com.google.android.material:material:1.12.0")
+    implementation("androidx.lifecycle:lifecycle-process:2.10.0")
+    testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test.ext:junit:1.1.4")
+    androidTestImplementation("androidx.test.espresso:espresso-core:3.5.0")
+}
+
+apply(from = file("tauri.build.gradle.kts"))
+`;
+
+function assertCompatibilityOverlay(source, dialect = "kotlin") {
+  const configured = injectWireGuardDependency(source, dialect);
+  assert.match(configured, /sourceCompatibility = JavaVersion\.VERSION_17/u);
+  assert.match(configured, /targetCompatibility = JavaVersion\.VERSION_17/u);
+  assert.doesNotMatch(configured, /VERSION_(?:1_8|11)\b|JVM_(?:1_8|11)\b|jvmTarget\s*=\s*["'](?:1\.8|11)["']/u);
+  assert.match(configured, dialect === "kotlin"
+    ? /isCoreLibraryDesugaringEnabled = true/u
+    : /coreLibraryDesugaringEnabled true/u);
+  for (const dependency of [WIREGUARD_DEPENDENCY, DESUGAR_DEPENDENCY]) {
+    assert.equal(configured.split(dependency).length - 1, 1);
+  }
+  assert.ok(configured.includes(`implementation("${WIREGUARD_DEPENDENCY}")`));
+  assert.ok(configured.includes(`coreLibraryDesugaring("${DESUGAR_DEPENDENCY}")`));
+  assert.equal(injectWireGuardDependency(configured, dialect), configured);
+  return configured;
+}
+
+test("CLI 2.12.4 compilerOptions and Java both target 17 without legacy kotlinOptions", () => {
+  const configured = assertCompatibilityOverlay(cli2124Gradle);
+  assert.match(configured, /kotlin \{\s+compilerOptions \{\s+jvmTarget = JvmTarget\.JVM_17/u);
+  assert.doesNotMatch(configured, /kotlinOptions/u);
+  // Everything outside the targets and managed overlays must survive unchanged.
+  const withoutOverlay = configured
+    .replace(/^ *\/\/ Noland Java 17 compatibility start\n[\s\S]*?^ *\/\/ Noland Java 17 compatibility end\n/gmu, "")
+    .replace(/^ *\/\/ Noland (?:native WireGuard tunnel|Java 17 core library desugaring) dependency\n[^\n]*\n/gmu, "");
+  assert.equal(withoutOverlay, cli2124Gradle
+    .replaceAll("JavaVersion.VERSION_1_8", "JavaVersion.VERSION_17")
+    .replace("JvmTarget.JVM_1_8", "JvmTarget.JVM_17"));
+});
+
+test("modern enum assignments and setters retain their syntax and qualification", () => {
+  for (const target of [
+    "jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_11",
+    "jvmTarget.set(JvmTarget.JVM_1_8)",
+    "jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_11)",
+  ]) {
+    const configured = assertCompatibilityOverlay(cli2124Gradle.replace("jvmTarget = JvmTarget.JVM_1_8", target));
+    assert.ok(configured.includes(target.replace(/JVM_(?:1_8|11)/u, "JVM_17")));
+    assert.doesNotMatch(configured, /kotlinOptions/u);
+  }
+});
+
+test("reapplying an old overlay to CLI 2.12.4 removes stale managed kotlinOptions", () => {
+  const previouslyConfigured = cli2124Gradle.replace("    buildFeatures {", `    // Noland Java 17 compatibility start
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+        isCoreLibraryDesugaringEnabled = true
+    }
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+    // Noland Java 17 compatibility end
+    buildFeatures {`);
+  assert.equal(assertCompatibilityOverlay(previouslyConfigured), injectWireGuardDependency(cli2124Gradle));
+});
+
+test("legacy Kotlin and Groovy templates keep JVM 17 and upgrade pinned overlay dependencies", () => {
+  for (const dialect of ["kotlin", "groovy"]) {
+    const source = `plugins { id("com.android.application") }
+android {
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_1_8
+        targetCompatibility = JavaVersion.VERSION_1_8
+        ${dialect === "kotlin" ? "isCoreLibraryDesugaringEnabled = false" : "coreLibraryDesugaringEnabled false"}
+    }
+    kotlinOptions {
+        jvmTarget = "1.8"
+    }
+}
+dependencies {
+    implementation("example:kept:1.0")
+    implementation("com.wireguard.android:tunnel:1.0.20250531")
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")
+}
+`;
+    const configured = assertCompatibilityOverlay(source, dialect);
+    assert.match(configured, /kotlinOptions \{\s+jvmTarget = "17"/u);
+    assert.ok(configured.includes('implementation("example:kept:1.0")'));
+    assert.doesNotMatch(configured, /1\.0\.20250531|desugar_jdk_libs:2\.0\.4|(?:DesugaringEnabled =|DesugaringEnabled) false/u);
+    const withoutKotlinOptions = source.replace(/    kotlinOptions \{\n[^\n]*\n    \}\n/u, "");
+    assert.match(assertCompatibilityOverlay(withoutKotlinOptions, dialect), /kotlinOptions \{\s+jvmTarget = "17"/u);
+  }
+});
 
 test("CI isolates the pinned NDK before Tauri discovery and exports a consistent toolchain", (t) => {
   const f = fixture(t);
