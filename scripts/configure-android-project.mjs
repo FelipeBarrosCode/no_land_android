@@ -175,6 +175,7 @@ export function injectWireGuardDependency(source, dialect = "kotlin") {
     "coreLibraryDesugaring",
     DESUGAR_DEPENDENCY,
   );
+  let hasCompilerOptionsTarget = false;
   configured = configured
     .replace(
       /^([ \t]*)sourceCompatibility(?:[ \t]*=[ \t]*|[ \t]+)JavaVersion\.VERSION_[A-Z0-9_]+[ \t]*$/gmu,
@@ -188,9 +189,21 @@ export function injectWireGuardDependency(source, dialect = "kotlin") {
       /^([ \t]*)jvmTarget[ \t]*=[ \t]*["'][^"']+["'][ \t]*$/gmu,
       '$1jvmTarget = "17"',
     )
+    // CLI 2.12 uses typed compilerOptions, whose explicit target takes precedence
+    // over the legacy android.kotlinOptions fallback.
+    .replace(
+      /^([ \t]*jvmTarget[ \t]*=[ \t]*(?:org\.jetbrains\.kotlin\.gradle\.dsl\.)?JvmTarget\.)JVM_[A-Z0-9_]+\b/gmu,
+      (_, prefix) => {
+        hasCompilerOptionsTarget = true;
+        return `${prefix}JVM_17`;
+      },
+    )
     .replace(
       /jvmTarget\.set\(([^\r\n]*JvmTarget\.)JVM_[A-Z0-9_]+\)/gu,
-      "jvmTarget.set($1JVM_17)",
+      (_, target) => {
+        hasCompilerOptionsTarget = true;
+        return `jvmTarget.set(${target}JVM_17)`;
+      },
     )
     .replace(
       /^([ \t]*)isCoreLibraryDesugaringEnabled[ \t]*=[ \t]*(?:true|false)[ \t]*$/gmu,
@@ -212,9 +225,11 @@ export function injectWireGuardDependency(source, dialect = "kotlin") {
     "    targetCompatibility = JavaVersion.VERSION_17",
     coreDesugaringSetting,
     "}",
-    "kotlinOptions {",
-    '    jvmTarget = "17"',
-    "}",
+    ...(hasCompilerOptionsTarget ? [] : [
+      "kotlinOptions {",
+      '    jvmTarget = "17"',
+      "}",
+    ]),
     managedCompatibilityEnd,
   ]);
   return injectManagedLines(configured, "dependencies", [
@@ -266,7 +281,7 @@ function configureAndroidProject() {
   if (configuredGradle !== originalGradle) writeFileSync(gradlePath, configuredGradle);
 
   console.log(
-    `Applied the Android overlay and ensured Java 17, core library desugaring, ${WIREGUARD_DEPENDENCY}, and ${DESUGAR_DEPENDENCY} in the generated app Gradle file.`,
+    `Applied the Android overlay and ensured Java/Kotlin JVM 17, core library desugaring, ${WIREGUARD_DEPENDENCY}, and ${DESUGAR_DEPENDENCY} in the generated app Gradle file.`,
   );
 }
 

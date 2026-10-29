@@ -88,7 +88,7 @@ libc = "0.2"
 arboard = { version = "3.4", default-features = false }
 portable-pty = "0.9.0"
 tauri-plugin-process = "2.0.0"
-tauri-plugin-updater = "2.0.0"
+tauri-plugin-updater = "2.14.1"
 
 [target.'cfg(any(target_os = "ios", target_os = "android"))'.dependencies]
 noland-ssh = { path = "crates/noland-ssh" }
