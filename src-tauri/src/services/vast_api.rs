@@ -173,14 +173,19 @@ impl VastApiClient {
         Ok(offers)
     }
 
-    pub async fn create_instance(
+    pub async fn create_instance<F, Fut>(
         &self,
         offer_id: u64,
         template_hash: &str,
         storage_gb: u32,
         label: &str,
         env_vars: Option<serde_json::Value>,
-    ) -> AppResult<VastInstance> {
+        on_created: F,
+    ) -> AppResult<VastInstance>
+    where
+        F: FnOnce(u64) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         let url = format!(
             "{}/api/v0/asks/{offer_id}/",
             self.base_url.trim_end_matches('/')
@@ -231,6 +236,8 @@ impl VastApiClient {
             offer_id, contract_id
         );
 
+        // Preserve the real rental ID even if the following details fetch is lost.
+        on_created(contract_id).await;
         let instance = self.get_instance(contract_id).await.map_err(|error| {
             warn!(
                 "Vast create_instance contract_id={} accepted but get_instance failed: {}",
@@ -461,7 +468,7 @@ impl VastApiClient {
         self.get_instance(instance_id).await
     }
 
-    pub async fn destroy_instance(&self, instance_id: u64) -> AppResult<()> {
+    pub async fn destroy_instance(&self, instance_id: u64) -> AppResult<bool> {
         let url = format!(
             "{}/api/v0/instances/{instance_id}/",
             self.base_url.trim_end_matches('/')
@@ -481,12 +488,16 @@ impl VastApiClient {
             .await
             .map_err(|error| map_send_error("DELETE", &url, error))?;
 
-        let _ = parse_response(response, "DELETE", &url, started).await?;
+        let status = response.status();
+        let body = parse_response(response, "DELETE", &url, started).await?;
+        let confirmed = status == reqwest::StatusCode::NO_CONTENT
+            || (status == reqwest::StatusCode::OK
+                && body.get("success").and_then(Value::as_bool) == Some(true));
         info!(
             "Vast destroy_instance instance_id={} succeeded",
             instance_id
         );
-        Ok(())
+        Ok(confirmed)
     }
 }
 

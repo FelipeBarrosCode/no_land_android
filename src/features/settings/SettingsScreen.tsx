@@ -645,7 +645,7 @@ export function SettingsScreen({
       </h2>
       <div className="mt-4 grid gap-3 md:grid-cols-3">
         <InputField
-          label={translate("generated.7e04950e0f3e2234")}
+          label={translate("feedback.b84f7697c079b8b8")}
           value={serverForm.minReliability}
           onChange={(event) =>
             setServerForm((prev) => ({

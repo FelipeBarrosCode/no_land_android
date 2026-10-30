@@ -161,6 +161,11 @@ int nl_video_renderer_setup(nl_video_renderer_t* renderer, int video_format, int
     return -1;
   }
   renderer->configured = false;
+#if defined(__ANDROID__)
+  __atomic_store_n(&renderer->decoded_output_frame_count, 0U, __ATOMIC_RELAXED);
+#else
+  renderer->decoded_output_frame_count = 0U;
+#endif
   renderer->video_format = video_format;
   renderer->width = width;
   renderer->height = height;

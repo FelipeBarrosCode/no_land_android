@@ -10,6 +10,10 @@ import type {
   ServerPreferences,
 } from "../../lib/types";
 import { APP_PROMPTS } from "../../prompts/appPrompts";
+import { MachineFeedbackMetrics } from "../feedback/MachineFeedbackMetrics";
+import { MachineReviewsModal } from "../feedback/MachineReviewsModal";
+import { providerDecimalId } from "../feedback/model";
+import { useMachineSummaries } from "../feedback/useMachineSummaries";
 
 interface Props {
   open: boolean;
@@ -133,9 +137,9 @@ function sortModeLabel(sortMode: SortMode): string {
     case "priceDesc":
       return translate("generated.62bb459519624447");
     case "reliabilityDesc":
-      return translate("generated.d846d24611604354");
+      return translate("feedback.sort.vastDescending");
     case "reliabilityAsc":
-      return translate("generated.4017ba60f523a84c");
+      return translate("feedback.sort.vastAscending");
     case "recommended":
     default:
       return translate("generated.b72924fa4d04fdea");
@@ -197,6 +201,7 @@ export function ServerPickerModal({
   );
   const storageInputRef = useRef(storageInput);
   const [pendingOfferId, setPendingOfferId] = useState<number | null>(null);
+  const [reviewMachine, setReviewMachine] = useState<{ machineId: string; gpuName: string; locationLabel: string } | null>(null);
 
   const countryOptions = useMemo<CountryOption[]>(() => {
     if (availableCountries.length === 0) {
@@ -305,6 +310,10 @@ export function ServerPickerModal({
     reliabilityRange.min,
     sortMode,
   ]);
+
+  const feedback = useMachineSummaries(open, displayedOffers);
+
+  useEffect(() => { if (!open || !feedback.enabled) setReviewMachine(null); }, [open, feedback.enabled]);
 
   const commitStorageInput = async () => {
     const parsed = Number(storageInputRef.current);
@@ -495,20 +504,20 @@ export function ServerPickerModal({
 
             <div className="rounded border border-[#3e4270] bg-[#0b0f23]/70 p-3">
               <p className="font-display text-[10px] uppercase tracking-[0.12em] text-[#9ad9ff]">
-                {translate("generated.2a0484303fb36b3f")}
+                {translate("feedback.c204bd0d84e4f626")}
               </p>
               <div className="mt-3 grid gap-2">
                 <Button
                   variant={sortMode === "reliabilityDesc" ? "secondary" : "ghost"}
                   onClick={() => setSortMode("reliabilityDesc")}
                 >
-                  {translate("generated.b9a06d5c358c64d0")}
+                  {translate("feedback.9b3a5ca4f7d93fcf")}
                 </Button>
                 <Button
                   variant={sortMode === "reliabilityAsc" ? "secondary" : "ghost"}
                   onClick={() => setSortMode("reliabilityAsc")}
                 >
-                  {translate("generated.968ff3bc38b80a22")}
+                  {translate("feedback.6cfb2b2634038111")}
                 </Button>
               </div>
             </div>
@@ -581,7 +590,7 @@ export function ServerPickerModal({
 
             <div className="rounded border border-[#3e4270] bg-[#0b0f23]/70 p-3">
               <p className="font-display text-[10px] uppercase tracking-[0.12em] text-[#9ad9ff]">
-                {translate("generated.cba70479842bde05")}
+                {translate("feedback.7c0d9d97bd35e6ef")}
               </p>
               {reliabilityRange.swapped && (
                 <p className="mt-1 text-[1rem] leading-none text-[#ffd78a]">
@@ -590,7 +599,7 @@ export function ServerPickerModal({
               )}
               <div className="mt-3 grid grid-cols-2 gap-2">
                 <label className="text-[1.05rem] text-[#b4c8de]">
-                  {translate("generated.865dfae5104a1411")}
+                  {translate("feedback.15685e9f355fdb72")}
                   <input
                     type="number"
                     min={0}
@@ -603,7 +612,7 @@ export function ServerPickerModal({
                   />
                 </label>
                 <label className="text-[1.05rem] text-[#b4c8de]">
-                  {translate("generated.946a0aa6108ce0b2")}
+                  {translate("feedback.430bee8678131133")}
                   <input
                     type="number"
                     min={0}
@@ -653,6 +662,13 @@ export function ServerPickerModal({
           {translate("generated.d604310a789a1848")} {displayedOffers.length} {translate("generated.28391d3bc64ec15c")} {offers.length} {translate("generated.80078650c6d04361")} {offersPage}
         </p>
 
+        {feedback.enabled && feedback.unavailable && (
+          <div className="feedback-ui mb-3 flex flex-wrap items-center gap-3 text-amber-200" role="status">
+            <p>{translate("feedback.235dacb815c3a772")}</p>
+            <Button type="button" variant="ghost" onClick={feedback.retry}>{translate("feedback.eefae8a75e3f6c88")}</Button>
+          </div>
+        )}
+
         <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
           {displayedOffers.length === 0 ? (
             <Card className="col-span-full text-[1.3rem] text-[#b4c8de]">
@@ -661,6 +677,7 @@ export function ServerPickerModal({
           ) : (
             displayedOffers.map((offer) => {
               const isSelected = offer.id === selectedOfferId;
+              const machineId = providerDecimalId(offer.providerMachineId);
               return (
                 <Card
                   key={offer.id}
@@ -732,8 +749,16 @@ export function ServerPickerModal({
                     </p>
                     <p>{translate("generated.de285d5895c16b9d")} {formatSpeed(offer.internetDownMbps)}</p>
                     <p>{translate("generated.63ff1ae736db3dd6")} {formatSpeed(offer.internetUpMbps)}</p>
-                    <p>{translate("generated.ec33b2e7693ac196")} {(offer.reliability * 100).toFixed(1)}%</p>
                   </div>
+
+                  <MachineFeedbackMetrics
+                    providerRatio={offer.reliability}
+                    machineId={machineId}
+                    enabled={feedback.enabled}
+                    unavailable={feedback.unavailable}
+                    summary={machineId ? feedback.summaries.get(machineId) : undefined}
+                    onReviews={() => { if (machineId) setReviewMachine({ machineId, gpuName: offer.gpuName, locationLabel: offer.locationLabel }); }}
+                  />
 
                   <Button
                     className="mt-3 w-full"
@@ -781,6 +806,14 @@ export function ServerPickerModal({
             </Button>
           </div>
         </div>
+
+        {reviewMachine && feedback.enabled && (
+          <MachineReviewsModal
+            {...reviewMachine}
+            summary={feedback.summaries.get(reviewMachine.machineId)}
+            onClose={() => setReviewMachine(null)}
+          />
+        )}
 
         {pendingOfferId !== null && (
           <ModalFrame

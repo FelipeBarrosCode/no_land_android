@@ -37,6 +37,8 @@ typedef struct nl_video_renderer {
   nl_surface_descriptor_t surface;
   nl_video_frame_metadata_t last_frame;
   uint64_t submitted_frame_count;
+  /* Actual Android decoder output released to the Surface, not encoded input. */
+  uint64_t decoded_output_frame_count;
   uint64_t dropped_frame_count;
   nl_latency_config_t latency_config;
   uint32_t client_refresh_rate_x100;
