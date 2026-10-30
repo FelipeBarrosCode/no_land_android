@@ -27,6 +27,7 @@ pub struct AppContext {
     pub state_store: Arc<dyn StateStore>,
     pub state: Arc<RwLock<PersistedAppState>>,
     pub http_client: reqwest::Client,
+    pub feedback: Arc<super::feedback::FeedbackProgramService>,
     pub provisioning_logs: Arc<RwLock<Vec<ProvisioningEvent>>>,
     pub offer_cache: Arc<RwLock<Vec<OfferCandidate>>>,
 
@@ -94,9 +95,15 @@ impl AppContext {
         state_store: Arc<dyn StateStore>,
         initial_state: PersistedAppState,
     ) -> Self {
+        let feedback_root = state_store
+            .path()
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let feedback = Arc::new(super::feedback::FeedbackProgramService::new(feedback_root));
         Self {
             config,
             state_store,
+            feedback,
             state: Arc::new(RwLock::new(initial_state)),
             http_client: reqwest::Client::new(),
             provisioning_logs: Arc::new(RwLock::new(Vec::new())),
@@ -146,10 +153,15 @@ impl AppContext {
         F: FnOnce(&mut PersistedAppState),
     {
         let mut state = self.state.write().await;
-        let mut next_state = state.clone();
+        let previous = state.clone();
+        let mut next_state = previous.clone();
         update(&mut next_state);
+        next_state.normalize_feedback_identifiers();
         self.state_store.save_state(&next_state).await?;
         *state = next_state.clone();
+        drop(state);
+        // Feedback errors remain isolated from the operational atomic state transaction.
+        self.feedback.observe_state(&previous, &next_state).await;
         Ok(next_state)
     }
 
@@ -163,7 +175,8 @@ impl AppContext {
             let mut state = self.state.write().await;
             *state = fresh_state.clone();
         }
-        Ok(fresh_state)
+        self.feedback.state_reloaded(self).await;
+        Ok(self.load_state().await)
     }
 
     pub async fn emit_progress(&self, app: &AppHandle, event: ProvisioningEvent) {

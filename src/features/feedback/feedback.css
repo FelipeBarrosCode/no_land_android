@@ -1,0 +1,46 @@
+.feedback-ui {
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 0.95rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.feedback-ui .feedback-input {
+  display: block;
+  width: 100%;
+  min-height: 44px;
+  margin-top: 0.3rem;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid #6b78a8;
+  border-radius: 0.2rem;
+  background: #0b0f23;
+  color: #e5f4ff;
+  font: inherit;
+}
+.feedback-ui .feedback-link {
+  display: inline-flex;
+  min-height: 44px;
+  align-items: center;
+  color: #9ee9ff;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.feedback-ui button, .feedback-ui input[type="radio"], .feedback-ui input[type="checkbox"] {
+  touch-action: manipulation;
+}
+.feedback-ui :focus-visible {
+  outline: 2px solid #61f7ff;
+  outline-offset: 3px;
+}
+.feedback-ui input[type="checkbox"], .feedback-ui input[type="radio"] {
+  width: 1.2rem;
+  height: 1.2rem;
+  flex-shrink: 0;
+  accent-color: #61f7ff;
+}
+.feedback-ui .feedback-choice {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  gap: 0.7rem;
+  padding: 0.5rem 0;
+}

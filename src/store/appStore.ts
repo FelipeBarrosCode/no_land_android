@@ -2523,7 +2523,7 @@ export const useAppStore = create<AppStore>((set, get) => {
 
 
     destroyInstance: async (instanceId) => {
-      await runInstanceTask(
+      const completed = await runInstanceTask(
         {
           key: "instance.destroy",
           label: translate("generated.0c9df74dc6eeab50"),
@@ -2542,9 +2542,13 @@ export const useAppStore = create<AppStore>((set, get) => {
                 : state.embeddedMoonlightStatus,
             activeMoonlightPairing: null,
           }));
+          return true;
         },
-        undefined,
+        false,
       );
+      // The confirmation must stay open with its staged draft when backup/delete fails.
+      // Other instance tasks retain their existing fallback behavior.
+      if (!completed) throw new Error(translate("feedback.538083716511788a"));
     },
 
 

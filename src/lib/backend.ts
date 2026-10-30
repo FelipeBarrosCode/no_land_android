@@ -1,5 +1,7 @@
 import { listen } from "@tauri-apps/api/event";
 import { invokeSafe } from "./tauri";
+import { offerMachineIdentity, parseFeedbackProgram } from "../features/feedback/model";
+import { invalidateFeedbackData } from "../features/feedback/data";
 import { getActiveLocale, translate } from "./i18n";
 import type {
   AutoShutdownSettings,
@@ -69,7 +71,12 @@ export async function moonlightPresentStream(): Promise<void> {
 }
 
 export async function getAppState(): Promise<PersistedAppState> {
-  return invokeSafe<PersistedAppState>("get_app_state");
+  const state = await invokeSafe<PersistedAppState>("get_app_state");
+  return {
+    ...state,
+    selectedOffer: state.selectedOffer ? offerMachineIdentity(state.selectedOffer) : null,
+    feedbackProgram: parseFeedbackProgram(state.feedbackProgram),
+  };
 }
 
 export async function getAutoShutdownSettings(): Promise<AutoShutdownState> {
@@ -118,7 +125,8 @@ export async function searchOffers(
   page = 1,
   pageSize = 24,
 ): Promise<OfferCandidate[]> {
-  return invokeSafe<OfferCandidate[]>("search_offers", { page, pageSize });
+  const offers = await invokeSafe<OfferCandidate[]>("search_offers", { page, pageSize });
+  return offers.map((offer) => offerMachineIdentity(offer));
 }
 
 export async function listAvailableOfferCountries(): Promise<
@@ -924,7 +932,12 @@ export async function rebootInstanceServices(
 
 
 export async function destroyInstance(instanceId: number): Promise<void> {
-  return invokeSafe<void>("destroy_instance", { instanceId });
+  invalidateFeedbackData();
+  try {
+    await invokeSafe<void>("destroy_instance", { instanceId });
+  } finally {
+    invalidateFeedbackData();
+  }
 }
 
 

@@ -1,3 +1,5 @@
+import type { FeedbackProgramState } from "../features/feedback/types";
+
 export type LocationSource = "os" | "ip" | "manual";
 
 export type OrchestrationState =
@@ -328,6 +330,8 @@ export interface OfferCountryAvailability {
 
 export interface OfferCandidate {
   id: number;
+  machineId?: string | null;
+  providerMachineId?: string | null;
   hostId: number | null;
   hostLabel: string;
   locationLabel: string;
@@ -360,6 +364,10 @@ export interface OfferCandidate {
 
 export interface InstanceState {
   instanceId: number | null;
+  machineId?: string | null;
+  providerMachineId?: string | null;
+  feedbackSessionId?: string | null;
+  feedbackJournalRef?: string | null;
   offerId: number | null;
   status: string;
   sshHost: string;
@@ -458,6 +466,10 @@ export interface ApplyDisplayModeResult {
 
 export interface ProvisionedServerState {
   instanceId: number;
+  machineId?: string | null;
+  providerMachineId?: string | null;
+  feedbackSessionId?: string | null;
+  feedbackJournalRef?: string | null;
   offerId: number | null;
   sshHost: string;
   sshPort: number;
@@ -555,6 +567,8 @@ export interface MoonlightHostLatencyPreferencesResponse {
 export interface RentedInstanceSummary {
   performanceOverlayEnabled: boolean;
   instanceId: number;
+  providerInstanceId?: string | null;
+  providerMachineId?: string | null;
   label: string;
   status: string;
   gpuName: string;
@@ -679,6 +693,7 @@ export interface AutoShutdownState {
 
 export interface PersistedAppState {
   version: number;
+  feedbackProgram: FeedbackProgramState;
   onboardingCompleted: boolean;
   hasCompletedGuidedSetup: boolean;
   credentials: CredentialsState;

@@ -45,6 +45,12 @@ impl JsonStateStore {
     fn migrate_value(&self, raw_value: Value) -> AppResult<PersistedAppState> {
         let mut baseline = serde_json::to_value(PersistedAppState::default())?;
         reconcile_json(&mut baseline, &raw_value);
+        // Never repair a malformed consent object by filling its missing members.
+        baseline["feedbackProgram"] = serde_json::to_value(
+            crate::models::feedback::FeedbackProgramState::from_untrusted(
+                raw_value.get("feedbackProgram"),
+            ),
+        )?;
 
         let mut migrated: PersistedAppState = serde_json::from_value(baseline)?;
         let current_instance_id = migrated.instance.instance_id;
@@ -78,6 +84,7 @@ impl JsonStateStore {
             migrated.ssh.ssh_password = "password".to_string();
         }
         migrated.version = self.current_version;
+        migrated.normalize_feedback_identifiers();
         migrated.server_preferences.template_hash =
             if migrated.server_preferences.template_hash.is_empty() {
                 "566868bff8b15eef891ee706acbbb5e5".to_string()
@@ -127,6 +134,37 @@ impl JsonStateStore {
                 self.state_path.display()
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod feedback_migration_tests {
+    use super::*;
+    #[test]
+    fn missing_partial_malformed_and_future_feedback_are_disabled() {
+        let store = JsonStateStore::new(PathBuf::from("unused.json"), 5);
+        for input in [
+            serde_json::json!({"version":4}),
+            serde_json::json!({"version":4,"feedbackProgram":{"enabled":true}}),
+            serde_json::json!({"feedbackProgram":"invalid"}),
+            serde_json::json!({"feedbackProgram":{"schemaVersion":99,"enabled":true}}),
+        ] {
+            let migrated = store.migrate_value(input).unwrap();
+            assert!(!migrated.feedback_program.enabled);
+            assert_eq!(migrated.version, 5);
+            assert!(migrated.feedback_program.installation_id.is_none());
+        }
+    }
+    #[test]
+    fn rental_alias_is_computed_before_the_javascript_number_boundary() {
+        let store = JsonStateStore::new(PathBuf::from("unused.json"), 5);
+        let migrated = store
+            .migrate_value(serde_json::json!({"instance":{"instanceId":9007199254740993_u64}}))
+            .unwrap();
+        assert_eq!(
+            migrated.instance.provider_instance_id.as_deref(),
+            Some("9007199254740993")
+        );
     }
 }
 

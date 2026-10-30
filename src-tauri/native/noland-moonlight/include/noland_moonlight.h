@@ -169,6 +169,7 @@ typedef struct nl_stats {
   uint8_t renderer_ready;
   uint8_t video_session_active;
   uint64_t renderer_submitted_frame_count;
+  uint64_t renderer_decoded_output_frame_count;
   uint64_t renderer_dropped_frame_count;
   uint64_t audio_init_count;
   uint64_t audio_sample_count;

@@ -122,6 +122,8 @@ pub enum RuntimeCommand {
 pub struct RuntimeStatistics {
     #[serde(skip)]
     pub sampled_at: std::time::Instant,
+    #[serde(skip)]
+    pub feedback_host_id: Option<String>,
     pub performance: crate::moonlight::performance::PerformanceStatistics,
     pub state: String,
     pub start_count: u64,
@@ -141,6 +143,7 @@ pub struct RuntimeStatistics {
     pub renderer_ready: bool,
     pub video_session_active: bool,
     pub renderer_submitted_frame_count: u64,
+    pub renderer_decoded_output_frame_count: u64,
     pub renderer_dropped_frame_count: u64,
     pub audio_init_count: u64,
     pub audio_sample_count: u64,
@@ -848,6 +851,7 @@ impl NativeRuntime {
             renderer_ready: 0,
             video_session_active: 0,
             renderer_submitted_frame_count: 0,
+            renderer_decoded_output_frame_count: 0,
             renderer_dropped_frame_count: 0,
             audio_init_count: 0,
             audio_sample_count: 0,
@@ -930,6 +934,7 @@ impl NativeRuntime {
             renderer_ready: output.renderer_ready != 0,
             video_session_active: output.video_session_active != 0,
             renderer_submitted_frame_count: output.renderer_submitted_frame_count,
+            renderer_decoded_output_frame_count: output.renderer_decoded_output_frame_count,
             renderer_dropped_frame_count: output.renderer_dropped_frame_count,
             audio_init_count: output.audio_init_count,
             audio_sample_count: output.audio_sample_count,
@@ -1073,6 +1078,7 @@ struct NativeStats {
     renderer_ready: bool,
     video_session_active: bool,
     renderer_submitted_frame_count: u64,
+    renderer_decoded_output_frame_count: u64,
     renderer_dropped_frame_count: u64,
     audio_init_count: u64,
     audio_sample_count: u64,
@@ -1386,6 +1392,7 @@ fn native_event_kind_label(kind: native::nl_event_kind_t) -> String {
 }
 
 fn runtime_statistics_from_native(
+    active_request: Option<&NativeStartRequest>,
     state: &SessionState,
     stats: &NativeStats,
     packet_size_controller: Option<&AdaptivePacketSizeController>,
@@ -1395,6 +1402,9 @@ fn runtime_statistics_from_native(
     let controller_snapshot = packet_size_controller.map(AdaptivePacketSizeController::snapshot);
     RuntimeStatistics {
         sampled_at: std::time::Instant::now(),
+        feedback_host_id: active_request
+            .filter(|r| r.session_generation == stats.session_generation)
+            .map(|r| r.host_id.clone()),
         performance: stats.performance.clone(),
         state: session_state_label(state),
         start_count: stats.start_count,
@@ -1414,6 +1424,7 @@ fn runtime_statistics_from_native(
         renderer_ready: stats.renderer_ready,
         video_session_active: stats.video_session_active,
         renderer_submitted_frame_count: stats.renderer_submitted_frame_count,
+        renderer_decoded_output_frame_count: stats.renderer_decoded_output_frame_count,
         renderer_dropped_frame_count: stats.renderer_dropped_frame_count,
         audio_init_count: stats.audio_init_count,
         audio_sample_count: stats.audio_sample_count,
@@ -1665,6 +1676,7 @@ pub fn spawn_runtime_actor(app_data_dir: PathBuf) -> MoonlightRuntimeHandle {
     let (state_tx, state_rx) = watch::channel(SessionState::Idle);
     let (stats_tx, stats_rx) = watch::channel(RuntimeStatistics {
         sampled_at: std::time::Instant::now(),
+        feedback_host_id: None,
         performance: Default::default(),
         state: session_state_label(&SessionState::Idle),
         start_count: 0,
@@ -1684,6 +1696,7 @@ pub fn spawn_runtime_actor(app_data_dir: PathBuf) -> MoonlightRuntimeHandle {
         renderer_ready: false,
         video_session_active: false,
         renderer_submitted_frame_count: 0,
+        renderer_decoded_output_frame_count: 0,
         renderer_dropped_frame_count: 0,
         audio_init_count: 0,
         audio_sample_count: 0,
@@ -2007,6 +2020,7 @@ pub fn spawn_runtime_actor(app_data_dir: PathBuf) -> MoonlightRuntimeHandle {
                         }
 
                         let _ = stats_tx.send(runtime_statistics_from_native(
+                            active_request.as_ref(),
                             &state,
                             &stats,
                             packet_size_controller.as_ref(),
@@ -2054,6 +2068,7 @@ pub fn spawn_runtime_actor(app_data_dir: PathBuf) -> MoonlightRuntimeHandle {
 
                                     let runtime_stats = native_runtime.read_stats().ok().map(|stats| {
                                         let runtime_stats = runtime_statistics_from_native(
+                                            active_request.as_ref(),
                                             &state,
                                             &stats,
                                             packet_size_controller.as_ref(),
@@ -2090,6 +2105,7 @@ pub fn spawn_runtime_actor(app_data_dir: PathBuf) -> MoonlightRuntimeHandle {
 
                                 if let Ok(stats) = native_runtime.read_stats() {
                                     let _ = stats_tx.send(runtime_statistics_from_native(
+                                        active_request.as_ref(),
                                         &state,
                                         &stats,
                                         packet_size_controller.as_ref(),
@@ -2128,6 +2144,7 @@ pub fn spawn_runtime_actor(app_data_dir: PathBuf) -> MoonlightRuntimeHandle {
                                 }
                                 if let Ok(stats) = native_runtime.read_stats() {
                                     let _ = stats_tx.send(runtime_statistics_from_native(
+                                        active_request.as_ref(),
                                         &state,
                                         &stats,
                                         packet_size_controller.as_ref(),

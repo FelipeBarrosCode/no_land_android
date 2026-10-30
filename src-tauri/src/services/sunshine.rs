@@ -886,6 +886,11 @@ fi'"#,
         self.assert_rtsp_port_available(remote, target_user, &target_home)
             .await?;
 
+        // Sunshine --creds only writes credentials to disk; the running service
+        // reloads them on restart, so write them before the service transaction.
+        self.bootstrap_web_credentials(remote, target_user, sunshine_username, sunshine_password)
+            .await?;
+
         // 5. Install and start Sunshine as a systemd system service running as {target_user}
         let has_noland_xorg = {
             let remote = remote.clone();
@@ -1106,7 +1111,7 @@ WantedBy=multi-user.target"#,
             )));
         }
 
-        self.bootstrap_web_credentials(remote, target_user, sunshine_username, sunshine_password)
+        self.verify_web_credentials(remote, sunshine_username, sunshine_password)
             .await?;
 
         info!(
@@ -1672,8 +1677,19 @@ echo "=== Setup Complete ==="
             )));
         }
 
+        Ok(())
+    }
+
+    async fn verify_web_credentials(
+        &self,
+        remote: &RemoteExec,
+        sunshine_username: &str,
+        sunshine_password: &str,
+    ) -> AppResult<()> {
+        let escaped_username = shell_single_quote_escape(sunshine_username);
+        let escaped_password = shell_single_quote_escape(sunshine_password);
         let verify_command = format!(
-            "curl -k -sS --connect-timeout 10 -u '\''{escaped_username}'\'':'\''{escaped_password}'\'' https://localhost:47990/api/config >/dev/null && echo CREDS_OK || echo CREDS_FAIL",
+            "curl -k -f -sS --noproxy '*' --connect-timeout 10 --max-time 20 -u '\''{escaped_username}'\'':'\''{escaped_password}'\'' --output /dev/null --write-out '%{{http_code}}' https://localhost:47990/api/config",
             escaped_username = escaped_username,
             escaped_password = escaped_password,
         );
@@ -1686,7 +1702,7 @@ echo "=== Setup Complete ==="
             .map_err(|error| AppError::Command(format!("join failure: {error}")))??
         };
 
-        if verify.status_code != 0 || !verify.stdout.contains("CREDS_OK") {
+        if verify.status_code != 0 || verify.stdout.trim() != "200" {
             return Err(AppError::Provisioning(format!(
                 "Sunshine credentials were set, but API auth verification failed. stdout: {} | stderr: {}",
                 verify.stdout.trim(),

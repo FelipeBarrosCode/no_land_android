@@ -1,5 +1,7 @@
 pub mod auto_shutdown;
 pub mod connection;
+pub mod feedback;
+pub use feedback::*;
 pub mod launch_library;
 pub mod shared_storage;
 
@@ -2553,6 +2555,9 @@ pub async fn resume_provisioning_existing_instance(
     context
         .update_state(|state| {
             state.instance.instance_id = Some(instance_id);
+            state.instance.machine_id = server.machine_id.clone();
+            state.instance.feedback_session_id = server.feedback_session_id.clone();
+            state.instance.feedback_journal_ref = server.feedback_journal_ref.clone();
             state.instance.offer_id = server.offer_id;
             state.instance.status = server.status.clone();
             state.instance.ssh_host = server.ssh_host.clone();
@@ -3080,6 +3085,8 @@ pub async fn get_rented_instances(
                         state.moonlight_preferences.showperfoverlay != 0,
                     ),
                 instance_id: instance.id,
+                provider_instance_id: Some(instance.id.to_string()),
+                machine_id: instance.machine_id.clone(),
                 label: if instance.label.is_empty() {
                     format!("Instance {}", instance.id)
                 } else {
@@ -3986,6 +3993,9 @@ async fn refresh_instance_connection_state(
             record.ssh_host = instance.ssh_host.clone();
             record.ssh_port = instance.ssh_port;
             record.ssh_command = instance.ssh_command.clone();
+            if instance.machine_id.is_some() {
+                record.machine_id = instance.machine_id.clone();
+            }
             record.connection_provider = ConnectionProvider::Wireguard;
             record.wireguard_server_ip = result.server_ip.clone();
             record.wireguard_client_ip = result.client_ip.clone();
@@ -3997,6 +4007,9 @@ async fn refresh_instance_connection_state(
             }
 
             state.instance.instance_id = Some(instance.id);
+            state.instance.machine_id = record.machine_id.clone();
+            state.instance.feedback_session_id = record.feedback_session_id.clone();
+            state.instance.feedback_journal_ref = record.feedback_journal_ref.clone();
             state.instance.status = instance.status.clone();
             state.instance.ssh_host = instance.ssh_host.clone();
             state.instance.ssh_port = instance.ssh_port;
@@ -4143,7 +4156,13 @@ pub(crate) async fn sync_instance_connection_internal(
             record.hourly_price = instance.hourly_price;
             record.compute_hourly_price = instance.compute_hourly_price;
             record.storage_hourly_price = instance.storage_hourly_price;
+            if instance.machine_id.is_some() {
+                record.machine_id = instance.machine_id.clone();
+            }
             state.instance.instance_id = Some(instance.id);
+            state.instance.machine_id = record.machine_id.clone();
+            state.instance.feedback_session_id = record.feedback_session_id.clone();
+            state.instance.feedback_journal_ref = record.feedback_journal_ref.clone();
             state.instance.status = instance.status.clone();
             state.instance.ssh_host = instance.ssh_host.clone();
             state.instance.ssh_port = instance.ssh_port;
@@ -4535,6 +4554,11 @@ async fn teardown_local_instance_session(
     moonlight: &MoonlightManager,
     instance_id: u64,
 ) {
+    context
+        .feedback
+        .observe_frame(context, &moonlight.runtime.latest_statistics())
+        .await;
+    context.feedback.checkpoint(context, false).await;
     if let Err(error) = MicPassthroughService::disable(context, instance_id).await {
         if !matches!(error, AppError::InvalidInput(_)) {
             warn!(
@@ -5700,6 +5724,11 @@ pub async fn moonlight_disconnect_stream(
     context: State<'_, AppContext>,
     moonlight: State<'_, MoonlightManager>,
 ) -> Result<MoonlightSessionStateResponse, FrontendError> {
+    context
+        .feedback
+        .observe_frame(context.inner(), &moonlight.runtime.latest_statistics())
+        .await;
+    context.feedback.checkpoint(context.inner(), false).await;
     #[cfg(target_os = "android")]
     {
         let _bookkeeping = ANDROID_STREAM_BOOKKEEPING.lock().await;

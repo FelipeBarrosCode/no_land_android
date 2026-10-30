@@ -38,6 +38,7 @@ import type {
   SoftwareArtworkResult,
 } from "../../lib/types";
 import { ServerPickerModal } from "../servers/ServerPickerModal";
+import { FeedbackProgramModal } from "../feedback/FeedbackProgramModal";
 import { SharedStorageExportModal } from "../shared-storage-manager/SharedStorageExportModal";
 import { InstanceCardActions } from "../shared-storage-manager/InstanceCardActions";
 import { InstanceDisplayModal } from "./InstanceDisplayModal";
@@ -214,6 +215,7 @@ export function DashboardScreen({
   onUploadPathsToInstance,
 }: Props) {
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [feedbackOpen, setFeedbackOpen] = useState(false);
   const [availableOfferCountries, setAvailableOfferCountries] = useState<
     OfferCountryAvailability[]
   >([]);
@@ -439,6 +441,7 @@ export function DashboardScreen({
             >
               {translate("generated.5abdf7d9b9336afa")}
             </h1>
+            <Button type="button" variant="ghost" className="mt-3 hidden md:inline-flex" onClick={() => setFeedbackOpen(true)}>{translate("feedback.54698a0574acf1a3")}</Button>
           </div>
 
           <MobileMenuButton
@@ -480,6 +483,7 @@ export function DashboardScreen({
           onClose={() => setMobileMenuOpen(false)}
         >
           <div className="grid gap-3">
+            <Button type="button" variant="ghost" onClick={() => { setMobileMenuOpen(false); setFeedbackOpen(true); }}>{translate("feedback.54698a0574acf1a3")}</Button>
             <Button
               variant={systemHealth?.ok === false ? "danger" : "secondary"}
               onClick={() => { setMobileMenuOpen(false); void handleHealthClick(); }}
@@ -507,6 +511,8 @@ export function DashboardScreen({
             </div>
           </div>
         </MobileSideMenu>
+
+        {feedbackOpen && <FeedbackProgramModal onClose={() => setFeedbackOpen(false)} />}
 
         {showDashboardGuidance ? (
           <section className="grid gap-4 md:grid-cols-3">

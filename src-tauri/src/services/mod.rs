@@ -1,4 +1,6 @@
 #[cfg(target_os = "android")]
+pub(crate) mod android_keystore;
+#[cfg(target_os = "android")]
 pub mod android_vpn;
 pub mod app_config;
 pub mod app_context;
@@ -8,6 +10,7 @@ pub mod cloudflare_turn;
 pub mod connection_manager;
 pub mod diagnostics;
 pub mod display_profile;
+pub mod feedback;
 pub mod health_check;
 pub mod instance_lifecycle;
 pub mod instance_manager;
