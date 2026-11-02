@@ -35,6 +35,7 @@ pub mod os_detection;
 mod package_manager;
 
 pub mod post_wireguard_setup;
+pub mod platform_credentials;
 pub mod reboot_helper;
 pub mod remote_display;
 #[cfg_attr(
