@@ -873,6 +873,10 @@ nl_result_t nl_runtime_start(nl_runtime_t* runtime, const nl_start_request_t* re
   }
   runtime->state = NL_STREAM_STATE_STARTING;
   runtime->session_generation = request->session_generation;
+#if defined(__ANDROID__)
+  /* No decoded evidence from a previous host/generation may leak into a new start. */
+  __atomic_store_n(&runtime->renderer.decoded_output_frame_count, 0U, __ATOMIC_RELAXED);
+#endif
   runtime->worker_running = true;
   runtime->stop_requested = false;
   runtime->connection_needs_cleanup = false;
@@ -1054,6 +1058,11 @@ nl_result_t nl_runtime_read_stats(nl_runtime_t* runtime, nl_stats_t* output) {
       output->renderer_ready = nl_video_renderer_is_ready(&runtime->renderer) ? 1U : 0U;
       output->video_session_active = nl_video_renderer_is_session_active(&runtime->renderer) ? 1U : 0U;
       output->renderer_submitted_frame_count = runtime->renderer.submitted_frame_count;
+#if defined(__ANDROID__)
+      output->renderer_decoded_output_frame_count = __atomic_load_n(&runtime->renderer.decoded_output_frame_count, __ATOMIC_RELAXED);
+#else
+      output->renderer_decoded_output_frame_count = 0U;
+#endif
       output->renderer_dropped_frame_count = runtime->renderer.dropped_frame_count;
       output->audio_init_count = runtime->audio_init_count;
       output->audio_sample_count = runtime->audio_sample_count;

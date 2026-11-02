@@ -223,6 +223,8 @@ fn link_android_compiler_runtime(target: &str) {
 }
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(noland_feedback_native_android)");
+    println!("cargo:rerun-if-env-changed=NOLAND_FEEDBACK_API_URL");
     println!("cargo:rerun-if-env-changed=NOLAND_SKIP_APP_BUILD_RS");
     println!("cargo:rerun-if-env-changed=NOLAND_SKIP_NATIVE_BUILD");
 
@@ -555,6 +557,8 @@ fn main() {
         ) {
             link_android_compiler_runtime(&target);
         }
+        // Only the actual Android native runtime path enables contribution capabilities.
+        println!("cargo:rustc-cfg=noland_feedback_native_android");
         for library in ["android", "log", "mediandk", "OpenSLES", "m"] {
             println!("cargo:rustc-link-lib={library}");
         }
@@ -932,6 +936,7 @@ pub struct nl_stats_t {
     pub renderer_ready: u8,
     pub video_session_active: u8,
     pub renderer_submitted_frame_count: u64,
+    pub renderer_decoded_output_frame_count: u64,
     pub renderer_dropped_frame_count: u64,
     pub audio_init_count: u64,
     pub audio_sample_count: u64,

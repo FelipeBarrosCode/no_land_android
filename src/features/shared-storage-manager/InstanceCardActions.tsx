@@ -4,6 +4,7 @@ import { useLocalization, translate } from "../../lib/i18n";
 import { Button } from "../../components/ui/Button";
 import { SpriteIcon } from "../../components/ui/SpriteIcon";
 import type { RentedInstanceSummary } from "../../lib/types";
+import { DestroyFeedbackConfirmation } from "../feedback/DestroyFeedbackConfirmation";
 
 interface Props {
   instance: RentedInstanceSummary;
@@ -42,15 +43,7 @@ export function InstanceCardActions({
     loadingKey === "instance.storage.sync" ||
     loadingKey === "instance.files.upload";
 
-  const handleDestroy = async () => {
-    if (!showDestroyConfirm) {
-      setShowDestroyConfirm(true);
-      return;
-    }
-
-    await onDestroy(instance.instanceId);
-    setShowDestroyConfirm(false);
-  };
+  const handleDestroy = () => setShowDestroyConfirm(true);
 
   return (
     <div className="space-y-2">
@@ -131,7 +124,7 @@ export function InstanceCardActions({
           onClick={handleDestroy}
         >
           {showDestroyConfirm ? (
-            "Confirm Destroy"
+            translate("feedback.3100ab8bacd41b70")
           ) : (
             <>
               <SpriteIcon icon="destroy" />
@@ -142,20 +135,13 @@ export function InstanceCardActions({
       </div>
 
       {showDestroyConfirm && (
-        <div className="text-xs text-red-300 bg-red-900/20 p-2 rounded border border-red-500/30">
-          {translate("generated.933882d245653198")} {instance.instanceId}{translate("generated.4567726876726721")}
-          <div className="mt-1 flex gap-2">
-            <button className="text-red-400 underline" onClick={handleDestroy}>
-              {translate("generated.3c98f82698fe06a8")}
-            </button>
-            <button
-              className="text-gray-400 underline"
-              onClick={() => setShowDestroyConfirm(false)}
-            >
-              {translate("generated.19766ed6ccb2f4a3")}
-            </button>
-          </div>
-        </div>
+        <DestroyFeedbackConfirmation
+          key={instance.instanceId}
+          instance={instance}
+          disabled={actionDisabled}
+          onDestroy={() => onDestroy(instance.instanceId)}
+          onCancel={() => setShowDestroyConfirm(false)}
+        />
       )}
     </div>
   );

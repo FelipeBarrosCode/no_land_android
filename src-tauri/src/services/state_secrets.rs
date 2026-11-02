@@ -18,16 +18,12 @@ use {
         aead::{Aead, Payload},
         Aes256Gcm, KeyInit, Nonce,
     },
-    rand::{rngs::OsRng, RngCore},
     std::{
-        fs::{self, OpenOptions},
-        io::Write,
+        fs,
         path::{Path, PathBuf},
     },
+    zeroize::Zeroize,
 };
-
-#[cfg(target_os = "android")]
-use crate::utils::atomic_file::write_atomically;
 
 use crate::{
     errors::{AppError, AppResult},
@@ -214,47 +210,46 @@ impl AndroidPrivateStateSecrets {
         ))
     }
 
-    fn set_owner_only(path: &Path) -> AppResult<()> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-                .map_err(|error| Self::error("restrict access to", error))?;
-        }
-        Ok(())
+    /// Read-only migration of the previous file-key format. New writes are Keystore-only.
+    fn legacy_key(&self) -> AppResult<[u8; Self::KEY_LENGTH]> {
+        let bytes = fs::read(self.root.join("master.key"))
+            .map_err(|error| Self::error("read legacy migration key", error))?;
+        bytes.try_into().map_err(|_| {
+            AppError::SecureStorage("Legacy Android migration key has an invalid length".into())
+        })
     }
 
-    fn master_key(&self) -> AppResult<[u8; Self::KEY_LENGTH]> {
-        fs::create_dir_all(&self.root)
-            .map_err(|error| Self::error("create secure storage", error))?;
-        let key_path = self.root.join("master.key");
-        if !key_path.exists() {
-            let mut key = [0_u8; Self::KEY_LENGTH];
-            OsRng.fill_bytes(&mut key);
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&key_path)
-            {
-                Ok(mut file) => {
-                    file.write_all(&key)
-                        .and_then(|()| file.sync_all())
-                        .map_err(|error| Self::error("initialize secure storage", error))?;
-                    Self::set_owner_only(&key_path)?;
-                    return Ok(key);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(Self::error("initialize secure storage", error)),
+    fn protected(
+        &self,
+        action: &str,
+        account: &str,
+        value: Option<&str>,
+    ) -> AppResult<Option<String>> {
+        super::android_keystore::account(action, &self.service, account, value)
+            .map_err(AppError::SecureStorage)
+    }
+
+    fn remove_legacy(&self, account: &str) -> AppResult<()> {
+        match fs::remove_file(self.account_path(account)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Self::error("remove migrated legacy blob", e)),
+        }
+        // Keep the old key only while other legacy accounts still require migration.
+        if self.root.exists()
+            && !fs::read_dir(&self.root)?.any(|entry| {
+                entry
+                    .ok()
+                    .is_some_and(|e| e.path().extension().is_some_and(|x| x == "secret"))
+            })
+        {
+            match fs::remove_file(self.root.join("master.key")) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(Self::error("remove legacy migration key", e)),
             }
         }
-
-        let bytes =
-            fs::read(&key_path).map_err(|error| Self::error("read secure storage key", error))?;
-        let key: [u8; Self::KEY_LENGTH] = bytes.try_into().map_err(|_| {
-            AppError::SecureStorage("Android secure storage key has an invalid length".to_string())
-        })?;
-        Self::set_owner_only(&key_path)?;
-        Ok(key)
+        Ok(())
     }
 
     fn account_path(&self, account: &str) -> PathBuf {
@@ -270,6 +265,11 @@ impl AndroidPrivateStateSecrets {
 #[cfg(target_os = "android")]
 impl StateSecretBackend for AndroidPrivateStateSecrets {
     fn get(&self, account: &str) -> AppResult<Option<String>> {
+        // An inaccessible Keystore is an error, never a reason to read a file-key fallback.
+        if let Some(value) = self.protected("stateRead", account, None)? {
+            self.remove_legacy(account)?;
+            return Ok(Some(value));
+        }
         let path = self.account_path(account);
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -282,9 +282,9 @@ impl StateSecretBackend for AndroidPrivateStateSecrets {
             ));
         }
 
-        let key = self.master_key()?;
+        let mut key = self.legacy_key()?;
         let cipher = Aes256Gcm::new_from_slice(&key)
-            .map_err(|error| Self::error("initialize protected state cipher", error))?;
+            .map_err(|error| Self::error("initialize legacy migration cipher", error))?;
         let nonce = Nonce::from_slice(&bytes[1..1 + Self::NONCE_LENGTH]);
         let plaintext = cipher
             .decrypt(
@@ -295,9 +295,17 @@ impl StateSecretBackend for AndroidPrivateStateSecrets {
                 },
             )
             .map_err(|error| Self::error("decrypt protected state", error))?;
-        String::from_utf8(plaintext)
-            .map(Some)
-            .map_err(|error| Self::error("decode protected state", error))
+        key.zeroize();
+        let value = String::from_utf8(plaintext)
+            .map_err(|error| Self::error("decode legacy state", error))?;
+        self.protected("stateWrite", account, Some(&value))?;
+        if self.protected("stateRead", account, None)?.as_deref() != Some(value.as_str()) {
+            return Err(AppError::SecureStorage(
+                "Keystore migration verification failed; legacy value retained".into(),
+            ));
+        }
+        self.remove_legacy(account)?;
+        Ok(Some(value))
     }
 
     fn put(&self, account: &str, value: &str) -> AppResult<()> {
@@ -305,29 +313,8 @@ impl StateSecretBackend for AndroidPrivateStateSecrets {
             return Ok(());
         }
 
-        let key = self.master_key()?;
-        let cipher = Aes256Gcm::new_from_slice(&key)
-            .map_err(|error| Self::error("initialize protected state cipher", error))?;
-        let mut nonce_bytes = [0_u8; Self::NONCE_LENGTH];
-        OsRng.fill_bytes(&mut nonce_bytes);
-        let ciphertext = cipher
-            .encrypt(
-                Nonce::from_slice(&nonce_bytes),
-                Payload {
-                    msg: value.as_bytes(),
-                    aad: &self.aad(account),
-                },
-            )
-            .map_err(|error| Self::error("encrypt protected state", error))?;
-
-        let mut payload = Vec::with_capacity(1 + Self::NONCE_LENGTH + ciphertext.len());
-        payload.push(Self::FORMAT_VERSION);
-        payload.extend_from_slice(&nonce_bytes);
-        payload.extend_from_slice(&ciphertext);
-        let path = self.account_path(account);
-        write_atomically(&path, &payload)
-            .map_err(|error| Self::error("save protected state", error))?;
-        Self::set_owner_only(&path)?;
+        self.protected("stateWrite", account, Some(value))?;
+        self.remove_legacy(account)?;
 
         if self.get(account)?.as_deref() != Some(value) {
             return Err(AppError::SecureStorage(
@@ -338,11 +325,8 @@ impl StateSecretBackend for AndroidPrivateStateSecrets {
     }
 
     fn delete(&self, account: &str) -> AppResult<()> {
-        match fs::remove_file(self.account_path(account)) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(Self::error("remove protected state", error)),
-        }
+        self.protected("stateDelete", account, None)?;
+        self.remove_legacy(account)
     }
 }
 

@@ -41,6 +41,8 @@ impl OfferSelector {
 
                 OfferCandidate {
                     id: offer.id,
+                    provider_offer_id: Some(offer.id.to_string()),
+                    machine_id: offer.machine_id.clone(),
                     host_id: offer.host_id,
                     host_label: offer.host_label.clone(),
                     location_label: format_location_label(&offer),

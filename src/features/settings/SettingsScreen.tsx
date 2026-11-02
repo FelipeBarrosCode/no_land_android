@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { errorMessage } from "../../lib/errorMessage";
+import { platformUsernameError, platformPasswordError } from "../../lib/platformCredentials";
 import { AIPromptHelper } from "../../components/ui/AIPromptHelper";
 import { APP_PROMPTS } from "../../prompts/appPrompts";
 import { ArcadeSoundToggle } from "../../components/ui/ArcadeSoundToggle";
@@ -450,12 +451,14 @@ export function SettingsScreen({
         <InputField
           label={translate("generated.c08537e7f04a3efa")}
           value={platformUsername}
+          error={platformUsernameError(platformUsername)}
           onChange={(event) => setPlatformUsername(event.target.value)}
         />
         <InputField
           label={translate("generated.05b11713ab17a2e3")}
           type="password"
           value={platformPassword}
+          error={platformPasswordError(platformPassword)}
           onChange={(event) => setPlatformPassword(event.target.value)}
         />
       </div>
@@ -463,13 +466,13 @@ export function SettingsScreen({
         <Button
           disabled={
             busy ||
-            platformUsername.trim().length < 3 ||
-            platformPassword.trim().length < 6
+            Boolean(platformUsernameError(platformUsername)) ||
+            Boolean(platformPasswordError(platformPassword))
           }
           onClick={() =>
             onSavePlatformCredentials({
-              appUsername: platformUsername.trim(),
-              appPassword: platformPassword.trim(),
+              appUsername: platformUsername,
+              appPassword: platformPassword,
             })
           }
         >
@@ -645,7 +648,7 @@ export function SettingsScreen({
       </h2>
       <div className="mt-4 grid gap-3 md:grid-cols-3">
         <InputField
-          label={translate("generated.7e04950e0f3e2234")}
+          label={translate("feedback.b84f7697c079b8b8")}
           value={serverForm.minReliability}
           onChange={(event) =>
             setServerForm((prev) => ({

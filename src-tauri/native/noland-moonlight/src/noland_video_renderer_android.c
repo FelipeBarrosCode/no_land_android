@@ -228,10 +228,11 @@ static bool nl_android_video_drain(nl_video_renderer_t* renderer, nl_android_vid
     AMediaCodecBufferInfo info;
     ssize_t index = AMediaCodec_dequeueOutputBuffer(ctx->codec, &info, 0);
     if (index >= 0) {
-      bool render = (info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG) == 0;
+      bool render = (info.flags & (AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG | AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM)) == 0;
       media_status_t status = AMediaCodec_releaseOutputBuffer(ctx->codec, (size_t)index, render);
       if (status != AMEDIA_OK) return nl_android_video_error(ctx, "release_output_failed", status);
       if (render) {
+        __atomic_add_fetch(&renderer->decoded_output_frame_count, 1U, __ATOMIC_RELAXED);
         if (!ctx->has_output) {
           ctx->has_output = true;
           nl_android_video_log(ctx, "output_ready", "first_decoded_frame", 0, 0, 0);

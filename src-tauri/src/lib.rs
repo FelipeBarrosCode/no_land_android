@@ -483,6 +483,7 @@ pub fn run() {
             });
             let performance_overlay = moonlight_manager.performance_overlay.clone();
             app.manage(moonlight_manager);
+            services::feedback::FeedbackProgramService::start(app.handle().clone(), context.clone());
             moonlight::platform::performance_overlay::start(app.handle().clone(), performance_overlay);
 
             let app_handle = app.handle().clone();
@@ -502,6 +503,17 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if let WindowEvent::Focused(focused) = event {
+                let context = window.state::<AppContext>().inner().clone();
+                let focused = *focused;
+                tauri::async_runtime::spawn(async move {
+                    // Android application Activity callbacks are authoritative for suspension.
+                    #[cfg(not(target_os = "android"))]
+                    context.feedback.set_foreground(focused);
+                    context.feedback.checkpoint(&context, false).await;
+                    if focused { context.feedback.wake.notify_one(); }
+                });
+            }
             if window.label() != moonlight::platform::STREAM_WINDOW_LABEL {
                 return;
             }
@@ -565,6 +577,8 @@ pub fn run() {
             let network_monitor = app.state::<network_monitor::NetworkMonitor>().inner().clone();
 
             tauri::async_runtime::spawn(async move {
+                mic_context.feedback.observe_frame(&mic_context, &runtime.latest_statistics()).await;
+                mic_context.feedback.checkpoint(&mic_context, false).await;
                 network_monitor.stop().await;
                 mic_context.set_stream_network_active(false);
                 let _ = runtime.stop().await;
@@ -588,6 +602,17 @@ pub fn run() {
             });
         })
         .invoke_handler(tauri::generate_handler![
+            feedback_program_status,
+            feedback_program_notices,
+            feedback_program_enroll,
+            feedback_program_consent,
+            feedback_program_delete,
+            feedback_machine_summaries,
+            feedback_machine_reviews,
+            feedback_review_report,
+            feedback_review_block_author,
+            feedback_review_eligibility,
+            feedback_stage_review,
             get_app_state,
             get_auto_shutdown_settings,
             get_instance_auto_shutdown_status,

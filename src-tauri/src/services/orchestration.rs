@@ -528,8 +528,16 @@ async fn run_orchestration(app: AppHandle, context: AppContext) -> AppResult<()>
         api_key,
     );
 
+    let unresolved_creation = context.feedback.has_pending_creation().await;
     match vast.list_instances().await {
         Ok(existing_instances) => {
+            if let Some(recovered_id) = context
+                .feedback
+                .recover_created(&context, &existing_instances)
+                .await
+            {
+                return run_existing_instance_orchestration(app, context, recovered_id).await;
+            }
             let existing_count = existing_instances
                 .iter()
                 .filter(|instance| {
@@ -548,6 +556,10 @@ async fn run_orchestration(app: AppHandle, context: AppContext) -> AppResult<()>
             }
         }
         Err(error) => {
+            if unresolved_creation {
+                // This is provider uncertainty after a possible paid create, not a feedback outage.
+                return Err(AppError::Api("A previous provider creation result is uncertain and owned rentals could not be reconciled. Refresh rentals before requesting another paid creation.".into()));
+            }
             warn!(
                 "Failed to list existing instances before create flow; continuing anyway: {}",
                 error
@@ -642,6 +654,8 @@ async fn run_orchestration(app: AppHandle, context: AppContext) -> AppResult<()>
         "-e PASS": env_pass
     });
 
+    // Best-effort local persistence must never make the provider operation depend on feedback.
+    let feedback_attempt = context.feedback.begin_rental(&context, &offer).await;
     let mut instance = match instance_manager
         .create_instance(
             &vast,
@@ -649,6 +663,8 @@ async fn run_orchestration(app: AppHandle, context: AppContext) -> AppResult<()>
             &initial_state.server_preferences.template_hash,
             initial_state.server_preferences.storage_gb,
             Some(env_vars),
+            &context,
+            feedback_attempt.as_deref(),
         )
         .await
     {
@@ -660,6 +676,15 @@ async fn run_orchestration(app: AppHandle, context: AppContext) -> AppResult<()>
             instance
         }
         Err(error) => {
+            // Reconcile the exact journal label before considering any paid retry/fallback.
+            // No matching record, list error, or a rejected create never produces a setup failure.
+            if feedback_attempt.is_some() {
+                if let Ok(instances) = vast.list_instances().await {
+                    if let Some(id) = context.feedback.recover_created(&context, &instances).await {
+                        return run_existing_instance_orchestration(app, context, id).await;
+                    }
+                }
+            }
             warn!(
                 "Provisioning create_instance failed offer_id={} error={}",
                 offer.id, error
@@ -692,6 +717,9 @@ async fn run_orchestration(app: AppHandle, context: AppContext) -> AppResult<()>
                     context
                         .update_state(|state| {
                             state.instance.instance_id = Some(existing.id);
+                            state.instance.machine_id = existing.machine_id.clone();
+                            state.instance.feedback_session_id = None;
+                            state.instance.feedback_journal_ref = None;
                             state.instance.status = existing.status.clone();
                             state.instance.ssh_host = existing.ssh_host.clone();
                             state.instance.ssh_port = existing.ssh_port;
@@ -735,6 +763,14 @@ async fn run_orchestration(app: AppHandle, context: AppContext) -> AppResult<()>
     context
         .update_state(|state| {
             state.instance.instance_id = Some(instance.id);
+            state.instance.machine_id = instance
+                .machine_id
+                .clone()
+                .or_else(|| offer.machine_id.clone());
+            state.instance.feedback_session_id = feedback_attempt.clone();
+            state.instance.feedback_journal_ref = feedback_attempt
+                .as_ref()
+                .map(|id| format!("feedback-v1/outbox.json#{id}"));
             state.instance.offer_id = Some(offer.id);
             state.instance.status = instance.status.clone();
             state.instance.ssh_host = instance.ssh_host.clone();
@@ -757,6 +793,10 @@ async fn run_orchestration(app: AppHandle, context: AppContext) -> AppResult<()>
         OrchestrationState::CreatingInstance,
     )
     .await?;
+    context
+        .feedback
+        .attached_rental(&context, instance.id)
+        .await;
     mark_server_step_completed(
         &context,
         instance.id,
@@ -1845,6 +1885,9 @@ async fn run_existing_instance_orchestration(
     context
         .update_state(|state| {
             state.instance.instance_id = Some(instance.id);
+            if instance.machine_id.is_some() {
+                state.instance.machine_id = instance.machine_id.clone();
+            }
             state.instance.offer_id = state
                 .instance
                 .offer_id
@@ -1870,6 +1913,10 @@ async fn run_existing_instance_orchestration(
         OrchestrationState::ConnectingSsh,
     )
     .await?;
+    context
+        .feedback
+        .attached_rental(&context, instance.id)
+        .await;
 
     instance =
         verify_instance_reserved_in_account(&app, &context, &vast, instance.id, offer_id).await?;
@@ -3352,9 +3399,13 @@ async fn verify_instance_reserved_in_account(
             let ssh_host = instance.ssh_host.clone();
             let ssh_port = instance.ssh_port;
             let ssh_command = instance.ssh_command.clone();
+            let machine_id = instance.machine_id.clone();
             context
                 .update_state(move |state| {
                     state.instance.instance_id = Some(instance_id);
+                    if machine_id.is_some() {
+                        state.instance.machine_id = machine_id.clone();
+                    }
                     state.instance.offer_id = offer_id.or(state.instance.offer_id);
                     state.instance.status = status.clone();
                     state.instance.ssh_host = ssh_host.clone();
@@ -3656,6 +3707,9 @@ async fn hydrate_state_from_server_record(
     context
         .update_state(move |state| {
             state.instance.instance_id = Some(instance_id);
+            state.instance.machine_id = record.machine_id.clone();
+            state.instance.feedback_session_id = record.feedback_session_id.clone();
+            state.instance.feedback_journal_ref = record.feedback_journal_ref.clone();
             if include_instance_metadata {
                 state.instance.offer_id = offer_id.or(state.instance.offer_id);
                 if !status.is_empty() {
@@ -3783,13 +3837,24 @@ async fn ensure_server_record(
     let status = status.to_string();
 
     // Get ssh_command from current instance state
-    let (ssh_command, hourly_price, compute_hourly_price, storage_hourly_price) = {
+    let (
+        ssh_command,
+        hourly_price,
+        compute_hourly_price,
+        storage_hourly_price,
+        machine_id,
+        feedback_session_id,
+        feedback_journal_ref,
+    ) = {
         let snapshot = context.state.read().await;
         (
             snapshot.instance.ssh_command.clone(),
             snapshot.instance.hourly_price,
             snapshot.instance.compute_hourly_price,
             snapshot.instance.storage_hourly_price,
+            snapshot.instance.machine_id.clone(),
+            snapshot.instance.feedback_session_id.clone(),
+            snapshot.instance.feedback_journal_ref.clone(),
         )
     };
 
@@ -3808,6 +3873,13 @@ async fn ensure_server_record(
             let record = &mut app_state.provisioned_servers[index];
 
             record.offer_id = offer_id.or(record.offer_id);
+            if machine_id.is_some() {
+                record.machine_id = machine_id.clone();
+            }
+            if feedback_session_id.is_some() {
+                record.feedback_session_id = feedback_session_id.clone();
+                record.feedback_journal_ref = feedback_journal_ref.clone();
+            }
             if !ssh_host.is_empty() {
                 record.ssh_host = ssh_host.clone();
             }

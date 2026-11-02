@@ -118,6 +118,11 @@ impl InstanceLifecycleService {
         context: &AppContext,
         owned_instances: &[VastInstance],
     ) -> AppResult<()> {
+        // A list disappearance is evidence of an observation gap, not a confirmed failure.
+        context
+            .feedback
+            .recover_created(context, owned_instances)
+            .await;
         let owned_instance_ids = owned_instances.iter().map(|instance| instance.id).collect();
         Self::remove_local_instances_missing_from_owned_set(context, &owned_instance_ids).await?;
 
@@ -139,6 +144,14 @@ impl InstanceLifecycleService {
                     record.offer_id = state.selected_offer.as_ref().and_then(|offer| {
                         (state.instance.instance_id == Some(instance.id)).then_some(offer.id)
                     });
+                    if instance.machine_id.is_some() {
+                        record.machine_id = instance.machine_id.clone();
+                    }
+                    if state.instance.instance_id == Some(instance.id)
+                        && instance.machine_id.is_some()
+                    {
+                        state.instance.machine_id = instance.machine_id.clone();
+                    }
                     record.status = instance.status.clone();
                     record.ssh_host = instance.ssh_host.clone();
                     record.ssh_port = instance.ssh_port;
@@ -186,6 +199,15 @@ impl InstanceLifecycleService {
             (removed, clear_active, clear_post_wireguard)
         };
 
+        let missing_ids = removed_records
+            .iter()
+            .map(|r| r.instance_id)
+            .collect::<Vec<_>>();
+        context
+            .feedback
+            .unknown_missing(context, &missing_ids)
+            .await;
+        context.feedback.checkpoint(context, false).await;
         for record in &removed_records {
             if record.wireguard_config_path.trim().is_empty() {
                 continue;
@@ -376,6 +398,7 @@ impl InstanceLifecycleService {
 
     /// Destroy a provisioned instance. Runs backup first if available.
     pub async fn destroy_instance(context: &AppContext, instance_id: u64) -> AppResult<()> {
+        context.feedback.checkpoint(context, false).await;
         Self::acquire_lock(instance_id, "destroy").await?;
 
         let result = async {
@@ -417,7 +440,13 @@ impl InstanceLifecycleService {
                 api_key,
             );
 
-            vast.destroy_instance(instance_id).await?;
+            let confirmed = vast.destroy_instance(instance_id).await?;
+            // Preserve legacy cleanup on other 2xx responses, but do not claim terminal evidence.
+            if confirmed {
+                context.feedback.milestone(context, instance_id, super::feedback::outbox::Milestone::Destroyed).await;
+            } else {
+                context.feedback.unknown_missing(context, &[instance_id]).await;
+            }
 
             if !wireguard_config_path.trim().is_empty() {
                 let config_path = Path::new(&wireguard_config_path);

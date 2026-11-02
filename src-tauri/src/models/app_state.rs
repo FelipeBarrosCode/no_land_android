@@ -39,12 +39,30 @@ pub struct PersistedAppState {
     #[serde(default)]
     pub connection_provider: ConnectionProvider,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub feedback_program: super::feedback::FeedbackProgramState,
+}
+
+impl PersistedAppState {
+    /// Feedback aliases are created from native integers before any JavaScript Number boundary.
+    pub fn normalize_feedback_identifiers(&mut self) {
+        self.instance.provider_instance_id = self.instance.instance_id.map(|id| id.to_string());
+        self.instance.provider_offer_id = self.instance.offer_id.map(|id| id.to_string());
+        if let Some(offer) = self.selected_offer.as_mut() {
+            offer.provider_offer_id = Some(offer.id.to_string());
+        }
+
+        for server in &mut self.provisioned_servers {
+            server.provider_instance_id = Some(server.instance_id.to_string());
+            server.provider_offer_id = server.offer_id.map(|id| id.to_string());
+        }
+    }
 }
 
 impl Default for PersistedAppState {
     fn default() -> Self {
         Self {
-            version: 4,
+            version: 5,
             onboarding_completed: false,
             has_completed_guided_setup: false,
             credentials: CredentialsState::default(),
@@ -67,6 +85,7 @@ impl Default for PersistedAppState {
             orchestration_state: OrchestrationState::Idle,
             connection_provider: ConnectionProvider::default(),
             last_error: None,
+            feedback_program: super::feedback::FeedbackProgramState::default(),
         }
     }
 }
@@ -253,6 +272,10 @@ fn default_mic_device_name() -> String {
 #[serde(rename_all = "camelCase")]
 pub struct OfferCandidate {
     pub id: u64,
+    #[serde(default)]
+    pub provider_offer_id: Option<String>,
+    #[serde(default)]
+    pub machine_id: Option<String>,
     pub host_id: Option<u64>,
     pub host_label: String,
     pub location_label: String,
@@ -308,6 +331,16 @@ pub struct OfferCountryAvailability {
 #[serde(rename_all = "camelCase")]
 pub struct InstanceState {
     pub instance_id: Option<u64>,
+    #[serde(default)]
+    pub provider_instance_id: Option<String>,
+    #[serde(default)]
+    pub provider_offer_id: Option<String>,
+    #[serde(default)]
+    pub machine_id: Option<String>,
+    #[serde(default)]
+    pub feedback_session_id: Option<String>,
+    #[serde(default)]
+    pub feedback_journal_ref: Option<String>,
     pub offer_id: Option<u64>,
     pub status: String,
     pub ssh_host: String,
@@ -327,6 +360,11 @@ impl Default for InstanceState {
     fn default() -> Self {
         Self {
             instance_id: None,
+            provider_instance_id: None,
+            provider_offer_id: None,
+            machine_id: None,
+            feedback_session_id: None,
+            feedback_journal_ref: None,
             offer_id: None,
             status: "idle".to_string(),
             ssh_host: String::new(),
@@ -624,6 +662,10 @@ pub struct RentedInstanceSummary {
     #[serde(default)]
     pub performance_overlay_enabled: bool,
     pub instance_id: u64,
+    #[serde(default)]
+    pub provider_instance_id: Option<String>,
+    #[serde(default)]
+    pub machine_id: Option<String>,
     pub label: String,
     pub status: String,
     pub gpu_name: String,
@@ -681,6 +723,16 @@ pub struct RemoteDisplayState {
 #[serde(rename_all = "camelCase")]
 pub struct ProvisionedServerState {
     pub instance_id: u64,
+    #[serde(default)]
+    pub provider_instance_id: Option<String>,
+    #[serde(default)]
+    pub provider_offer_id: Option<String>,
+    #[serde(default)]
+    pub machine_id: Option<String>,
+    #[serde(default)]
+    pub feedback_session_id: Option<String>,
+    #[serde(default)]
+    pub feedback_journal_ref: Option<String>,
     pub offer_id: Option<u64>,
     pub ssh_host: String,
     pub ssh_port: u16,
@@ -759,6 +811,11 @@ impl ProvisionedServerState {
     pub fn new(instance_id: u64) -> Self {
         Self {
             instance_id,
+            provider_instance_id: Some(instance_id.to_string()),
+            provider_offer_id: None,
+            machine_id: None,
+            feedback_session_id: None,
+            feedback_journal_ref: None,
             offer_id: None,
             ssh_host: String::new(),
             ssh_port: 22,

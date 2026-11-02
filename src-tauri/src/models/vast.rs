@@ -6,6 +6,8 @@ use std::net::IpAddr;
 #[serde(rename_all = "camelCase")]
 pub struct VastOffer {
     pub id: u64,
+    #[serde(default)]
+    pub machine_id: Option<String>,
     pub host_id: Option<u64>,
     pub host_label: String,
     pub city: String,
@@ -66,6 +68,9 @@ impl VastOffer {
 
         Some(Self {
             id,
+            machine_id: value
+                .get("machine_id")
+                .and_then(super::feedback::provider_id),
             host_id: value.get("host_id").and_then(Value::as_u64),
             host_label,
             city,
@@ -191,6 +196,8 @@ fn parse_offer_type(value: &Value) -> String {
 #[serde(rename_all = "camelCase")]
 pub struct VastInstance {
     pub id: u64,
+    #[serde(default)]
+    pub machine_id: Option<String>,
     pub label: String,
     pub status: String,
     pub ssh_host: String,
@@ -290,6 +297,9 @@ impl VastInstance {
 
         Some(Self {
             id,
+            machine_id: value
+                .get("machine_id")
+                .and_then(super::feedback::provider_id),
             label: value
                 .get("label")
                 .or_else(|| value.get("hostname"))
@@ -1001,6 +1011,24 @@ pub fn region_to_code(full_name: &str) -> String {
 mod tests {
     use super::{VastInstance, VastOffer};
     use serde_json::json;
+
+    #[test]
+    fn feedback_machine_identity_is_lossless_and_never_an_alias() {
+        let offer = VastOffer::from_value(
+            &serde_json::json!({"id": 12, "host_id": 13, "machine_id": 9007199254740993_u64}),
+        )
+        .unwrap();
+        assert_eq!(offer.machine_id.as_deref(), Some("9007199254740993"));
+        assert_eq!(offer.id, 12);
+        assert_eq!(offer.host_id, Some(13));
+        let missing =
+            VastOffer::from_value(&serde_json::json!({"id": 12, "host_id": 13, "hosting_id": 14}))
+                .unwrap();
+        assert_eq!(missing.machine_id, None);
+        let instance = VastInstance::from_value(&serde_json::json!({"id":"9007199254740995", "machine_id":"9007199254740993", "host_id":13})).unwrap();
+        assert_eq!(instance.id.to_string(), "9007199254740995");
+        assert_eq!(instance.machine_id, offer.machine_id);
+    }
 
     #[test]
     fn offer_prefers_effective_discounted_search_total() {

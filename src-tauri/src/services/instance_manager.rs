@@ -24,13 +24,26 @@ impl InstanceManager {
         template_hash: &str,
         storage_gb: u32,
         env_vars: Option<serde_json::Value>,
+        context: &super::app_context::AppContext,
+        feedback_attempt: Option<&str>,
     ) -> AppResult<VastInstance> {
+        let label = feedback_attempt
+            .map(|id| format!("Noland Connect Session {id}"))
+            .unwrap_or_else(|| "Noland Connect Session".into());
         api.create_instance(
             offer_id,
             template_hash,
             storage_gb,
-            "Noland Connect Session",
+            &label,
             env_vars,
+            |id| async move {
+                if let Some(attempt) = feedback_attempt {
+                    context
+                        .feedback
+                        .confirmed_rental(context, attempt, id, true)
+                        .await;
+                }
+            },
         )
         .await
     }
