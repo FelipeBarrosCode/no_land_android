@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { platformUsernameError, platformPasswordError } from "../../lib/platformCredentials";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Button } from "../../components/ui/Button";
 import { Card } from "../../components/ui/Card";
@@ -43,10 +44,8 @@ export function OnboardingScreen({ busy, onSubmit }: Props) {
 
   const errors = useMemo(() => {
     return {
-      appUsername:
-        form.appUsername.trim().length < 3 ? "Use at least 3 characters" : "",
-      appPassword:
-        form.appPassword.length < 6 ? "Use at least 6 characters" : "",
+      appUsername: platformUsernameError(form.appUsername),
+      appPassword: platformPasswordError(form.appPassword),
       vastApiKey:
         form.vastApiKey.trim().length < 16 ? "API key seems too short" : "",
     };
@@ -65,7 +64,7 @@ export function OnboardingScreen({ busy, onSubmit }: Props) {
     }
 
     await onSubmit({
-      appUsername: form.appUsername.trim(),
+      appUsername: form.appUsername,
       appPassword: form.appPassword,
       vastApiKey: form.vastApiKey.trim(),
     });
@@ -182,7 +181,7 @@ export function OnboardingScreen({ busy, onSubmit }: Props) {
               onBlur={() =>
                 setTouched((prev) => ({ ...prev, appUsername: true }))
               }
-              error={touched.appUsername ? errors.appUsername : undefined}
+              error={touched.appUsername || form.appUsername ? errors.appUsername : undefined}
             />
             <InputField
               label={t("onboarding.password")}
@@ -197,7 +196,7 @@ export function OnboardingScreen({ busy, onSubmit }: Props) {
               onBlur={() =>
                 setTouched((prev) => ({ ...prev, appPassword: true }))
               }
-              error={touched.appPassword ? errors.appPassword : undefined}
+              error={touched.appPassword || form.appPassword ? errors.appPassword : undefined}
             />
             <p className="-mt-2 text-[1.1rem] text-[#8fb4d4]">
               {t("onboarding.new")} {" "}
