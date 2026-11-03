@@ -1,4 +1,5 @@
 {
+  "storage.allocation.range": "此实例的可用范围：{min}–{max} GB（整数）。",
   "mobile.returnToStream": "返回串流",
   "mobile.streamStats": "{{fps}} FPS · 解码 {{decode}} 毫秒",
   "app.settings": "设置",
