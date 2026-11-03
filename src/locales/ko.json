@@ -1,4 +1,5 @@
 {
+  "storage.allocation.range": "이 인스턴스의 사용 가능 범위: {min}–{max} GB (정수).",
   "mobile.returnToStream": "스트리밍으로 돌아가기",
   "mobile.streamStats": "{{fps}} FPS · 디코딩 {{decode}} ms",
   "app.settings": "계정 설정",

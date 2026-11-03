@@ -1,4 +1,5 @@
 {
+  "storage.allocation.range": "Plage disponible pour cette instance : {min}–{max} Go (nombres entiers).",
   "mobile.returnToStream": "Revenir au streaming",
   "mobile.streamStats": "{{fps}} IPS · {{decode}} ms de décodage",
   "app.settings": "Paramètres",

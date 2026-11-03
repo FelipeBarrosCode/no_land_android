@@ -1,4 +1,5 @@
 {
+  "storage.allocation.range": "Rango disponible para esta instancia: {min}–{max} GB (números enteros).",
   "mobile.returnToStream": "Volver a la transmisión",
   "mobile.streamStats": "{{fps}} FPS · {{decode}} ms de decodificación",
   "app.settings": "Ajustes",
