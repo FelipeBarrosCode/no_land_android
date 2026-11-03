@@ -79,6 +79,10 @@ export async function getAppState(): Promise<PersistedAppState> {
   };
 }
 
+export async function applyInstanceDesktopPassword(instanceId: number): Promise<void> {
+  return invokeSafe<void>("apply_instance_desktop_password", { instanceId });
+}
+
 export async function getAutoShutdownSettings(): Promise<AutoShutdownState> {
   return invokeSafe<AutoShutdownState>("get_auto_shutdown_settings");
 }
