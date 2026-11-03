@@ -17,6 +17,8 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Public endpoint embedded by Rust option_env! at compile time.
+  NOLAND_FEEDBACK_API_URL: ${{ secrets.NOLAND_FEEDBACK_API_URL }}
 
 concurrency:
   group: app-store-connect
