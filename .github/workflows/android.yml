@@ -17,6 +17,8 @@ concurrency:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Public endpoint embedded by Rust option_env! at compile time.
+  NOLAND_FEEDBACK_API_URL: ${{ secrets.NOLAND_FEEDBACK_API_URL }}
   JAVA_VERSION: "21"
   NODE_VERSION: "22"
   ANDROID_HOME: /usr/local/lib/android/sdk
