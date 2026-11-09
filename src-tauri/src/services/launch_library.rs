@@ -28,6 +28,7 @@ pub(crate) struct LaunchLibraryEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LaunchPlan {
+    Runtime(String),
     Steam(u32),
     Desktop(String),
     Executable(String),
@@ -40,7 +41,27 @@ pub(crate) async fn load_launch_library(
     instance_id: u64,
     launch_pc_available: bool,
 ) -> AppResult<(LaunchLibraryResponse, Vec<LaunchLibraryEntry>)> {
-    let local = SharedStorageManager::list_agent_app_records(remote, target_user).await?;
+    let mut local = SharedStorageManager::list_agent_app_records(remote, target_user).await?;
+    // Runtime availability must not block native/Steam library access.
+    match super::runtime_manager::apps(remote, target_user).await {
+        Ok(apps) => local.extend(
+            apps.into_iter()
+                .filter(|a| a.profile == noland_runtime_contracts::PROFILE)
+                .map(|app| AgentAppRecord {
+                    app_id: format!("runtime:{}", app.id),
+                    display_name: app.name,
+                    canonical_executable: Some(app.file),
+                    desktop_entry_id: None,
+                    steam_app_id: None,
+                    launcher: Some("noland-runtime".into()),
+                    aliases: vec![],
+                    icon_path: None,
+                }),
+        ),
+        Err(error) => {
+            warn!(%error, "Optional runtime library unavailable; keeping native/Steam routes")
+        }
+    }
     let catalog = match SharedStorageManager::list_agent_catalog_records(
         context,
         remote,
@@ -123,9 +144,9 @@ pub(crate) async fn launch_remote_software(
             .find(|value| !value.is_empty())
             .unwrap_or("remote launcher returned no details")
             .to_string();
-        if matches!(plan, LaunchPlan::Steam(_)) {
+        if matches!(plan, LaunchPlan::Steam(_) | LaunchPlan::Runtime(_)) {
             return Err(AppError::Command(format!(
-                "Could not launch {} through Steam: {}",
+                "Could not launch {} through its selected route: {}",
                 entry.item.display_name, details
             )));
         }
@@ -341,6 +362,10 @@ pub(crate) async fn verify_entry_launch_target(
         return Ok(false);
     };
     let script = match plan {
+        LaunchPlan::Runtime(id) => format!(
+            "test -x /usr/local/bin/noland-runtime && /usr/local/bin/noland-runtime status --json | python3 -c {}",
+            shell_quote(&format!("import json,sys; s=json.load(sys.stdin); sys.exit(0 if s.get('installed') and any(a.get('id') == {id:?} for a in s.get('apps', [])) else 1)"))
+        ),
         LaunchPlan::Executable(executable) => format!(
             "path={}\ncase \"$path\" in */*) case \"$path\" in *.[jJ][aA][rR]|*.[eE][xX][eE]) test -f \"$path\" ;; *) test -f \"$path\" -a -x \"$path\" ;; esac ;; *) command -v \"$path\" >/dev/null 2>&1 ;; esac",
             shell_quote(&executable)
@@ -420,6 +445,15 @@ PY"#
 }
 
 fn launch_plan(entry: &LaunchLibraryEntry) -> Option<LaunchPlan> {
+    if entry.launcher.as_deref() == Some("noland-runtime") {
+        let id = entry.item.app_id.strip_prefix("runtime:")?;
+        return (!id.is_empty()
+            && id.len() <= 96
+            && id
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'))
+        .then(|| LaunchPlan::Runtime(id.into()));
+    }
     if let Some(steam_id) = entry
         .steam_app_id
         .or_else(|| parse_steam_app_id(&entry.item.app_id, entry.launcher.as_deref()))
@@ -452,6 +486,7 @@ fn launch_method_for_entry(entry: &LaunchLibraryEntry) -> Option<String> {
         .map(|plan| {
             match plan {
                 LaunchPlan::Steam(_) => "steam",
+                LaunchPlan::Runtime(_) => "runtime:ubuntu24-x86_64",
                 LaunchPlan::Desktop(_) => "desktop",
                 LaunchPlan::Executable(_) => "executable",
             }
@@ -795,6 +830,7 @@ fi
 
 fn launch_script(plan: &LaunchPlan) -> AppResult<String> {
     let launch = match plan {
+        LaunchPlan::Runtime(id) => format!("/usr/local/bin/noland-runtime launch --app-id {}", shell_quote(id)),
         LaunchPlan::Steam(app_id) => {
             STEAM_LAUNCH_TEMPLATE.replace("__STEAM_APP_ID__", &app_id.to_string())
         }
@@ -814,7 +850,7 @@ fn launch_script(plan: &LaunchPlan) -> AppResult<String> {
             exe = shell_quote(executable),
         ),
     };
-    if matches!(plan, LaunchPlan::Steam(_)) {
+    if matches!(plan, LaunchPlan::Steam(_) | LaunchPlan::Runtime(_)) {
         return Ok(launch);
     }
 
@@ -1129,6 +1165,34 @@ mod tests {
         assert_eq!(item.launch_method, "steam");
         assert_eq!(item.latest_bundle_id.as_deref(), Some("bundle-1"));
         assert!(item.aliases.contains(&"Spacewar Cloud".to_string()));
+    }
+
+    #[test]
+    fn runtime_route_keeps_app_ids_literal_and_does_not_inherit_parent_session() {
+        let mut entries = merge_launch_library(
+            vec![AgentAppRecord {
+                app_id: "runtime:app-123".into(),
+                display_name: "Modern App".into(),
+                canonical_executable: Some("/home/user/Modern App.AppImage".into()),
+                desktop_entry_id: None,
+                steam_app_id: None,
+                launcher: Some("noland-runtime".into()),
+                aliases: vec![],
+                icon_path: None,
+            }],
+            vec![],
+        );
+        assert_eq!(
+            launch_plan(&entries[0]),
+            Some(LaunchPlan::Runtime("app-123".into()))
+        );
+        assert_eq!(entries[0].item.launch_method, "runtime:ubuntu24-x86_64");
+        assert_eq!(
+            launch_script(&LaunchPlan::Runtime("app-123".into())).unwrap(),
+            "/usr/local/bin/noland-runtime launch --app-id 'app-123'"
+        );
+        entries[0].item.app_id = "runtime:bad; touch owned".into();
+        assert_eq!(launch_plan(&entries[0]), None);
     }
 
     #[test]

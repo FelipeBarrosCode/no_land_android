@@ -630,6 +630,8 @@ pub fn run() {
             resume_provisioning_existing_instance,
             start_play_existing_instance,
             get_instance_launch_library,
+            get_instance_runtime_status,
+            instance_runtime_action,
             launch_instance_software,
             get_launch_instance_software_job,
             get_software_artwork,

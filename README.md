@@ -240,3 +240,8 @@ The project is actively evolving around:
 **Cloud gaming without giving up the freedom of a real PC.**
 
 </div>
+# Optional Modern Linux Runtime
+
+The mobile launch library includes controls for the remote Ubuntu 24.04 runtime
+preview. See [docs/runtime.md](docs/runtime.md) for signed-release setup, usage
+and remaining device/GPU acceptance gates. Linux apps run on the cloud PC, not Android.

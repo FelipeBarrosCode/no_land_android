@@ -3357,6 +3357,7 @@ dependencies = [
  "ndk-context",
  "noland-network-contracts",
  "noland-rclone-adapter",
+ "noland-runtime-contracts",
  "noland-ssh",
  "parking_lot",
  "portable-pty",
@@ -3434,6 +3435,13 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "noland-runtime-contracts"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
