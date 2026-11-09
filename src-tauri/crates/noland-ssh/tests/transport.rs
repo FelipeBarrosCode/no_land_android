@@ -37,9 +37,9 @@ impl server::Handler for Handler {
     async fn auth_publickey(
         &mut self,
         _: &str,
-        key: &PublicKey,
+        key: server::VerifiedPublicKey<'_>,
     ) -> Result<server::Auth, Self::Error> {
-        Ok(if key == &self.expected_key {
+        Ok(if key.public_key == &self.expected_key {
             server::Auth::Accept
         } else {
             server::Auth::reject()
