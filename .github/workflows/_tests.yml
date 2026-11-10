@@ -23,7 +23,7 @@ jobs:
             network-contracts
             network-agent
       - run: npm ci
-      - run: npm run test:runtime
+      - run: npm run test:scripts
       - name: Existing unit-test entry point
         run: npm run test:unit
 

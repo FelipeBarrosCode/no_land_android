@@ -3,6 +3,17 @@ title = "No Land Gitleaks configuration"
 [extend]
 useDefault = true
 
+# Exclude only a generated locale key captured across a JSON property boundary.
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
+description = "Cross-property generated translation IDs, not credential assignments"
+condition = "AND"
+paths = ['''(?:^|/)src/locales/[^/]+\.json$''']
+regexTarget = "match"
+regexes = ['''^[^\r\n"]*",\r?\n[ \t]+"generated\.[0-9a-f]{16}"$''']
+
 [allowlist]
 description = "Known non-secret protocol example and redacted legacy README credential"
 regexTarget = "secret"
