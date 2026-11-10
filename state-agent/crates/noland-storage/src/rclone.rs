@@ -132,7 +132,7 @@ impl RcloneCommandBuilder {
         // cat produces an ordered stream; copyto's multistream output may have holes.
         // Parallelism is across packs, with OS pipe backpressure instead of disk copies.
         let mut args = vec!["cat".into()];
-        self.push_upload_options(&mut args);
+        self.push_backend_options(&mut args);
         args.push(source);
         args
     }
