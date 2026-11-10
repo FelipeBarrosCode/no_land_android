@@ -2,6 +2,7 @@ name: Reusable full test suite
 
 on:
   workflow_call:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -23,7 +24,7 @@ jobs:
             network-contracts
             network-agent
       - run: npm ci
-      - run: npm run test:runtime
+      - run: npm run test:scripts
       - name: Existing unit-test entry point
         run: npm run test:unit
 
@@ -48,6 +49,9 @@ jobs:
       - name: Prepare required desktop sidecars
         run: node scripts/prepare-mic-sidecar.mjs dev
       - name: Run desktop workspace tests
+        env:
+          # Host unit tests do not package release-only SSH/agent resources.
+          TAURI_CONFIG: '{"bundle":{"resources":[]}}'
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --workspace --all-targets
 
   state-agent-tests:

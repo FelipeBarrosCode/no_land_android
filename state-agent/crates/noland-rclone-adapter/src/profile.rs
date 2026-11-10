@@ -210,6 +210,7 @@ impl TransferProfile {
     }
 }
 
+/// Prevent backend-specific flags from leaking into another provider's stream.
 pub fn provider_arg_is_allowed(provider: ProviderKind, arg: &str) -> bool {
     if arg.starts_with("--s3-") {
         matches!(

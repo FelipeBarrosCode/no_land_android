@@ -11,7 +11,7 @@ const copy = new Map();
 const attributes = new Set(["title", "placeholder", "aria-label", "alt", "data-text", "loadingText", "label", "description", "topic"]);
 const setters = new Set(["setError", "setNotice", "setActionMessage"]);
 const visible = (text) => /[A-Za-zÀ-ÿ]/u.test(text);
-const normalized = (text) => text.replace(/&gt;/g, ">").replace(/&lt;/g, "<").replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/\s+/g, " ").trim();
+const normalized = (text) => text.replace(/&(gt|lt|amp|quot);/g, (_, entity) => ({ gt: ">", lt: "<", amp: "&", quot: '"' })[entity]).replace(/\s+/g, " ").trim();
 function keyFor(message) {
   const existing = Object.entries(english).find(([, value]) => value === message)?.[0];
   if (existing) return existing;

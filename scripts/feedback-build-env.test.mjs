@@ -18,12 +18,13 @@ test('every distributable app build receives the feedback API secret at compile 
   assert.ok(builds > 0, 'at least one app build was checked');
 });
 
-test('release and nightly callers pass secrets to the reusable build', () => {
-  for (const name of ['release.yml', 'nightly.yml']) {
-    const source = readFileSync(new URL(name, directory), 'utf8');
-    const job = source.match(/^  build:\n([\s\S]*?)(?=^  [\w-]+:|$(?![\s\S]))/m)?.[1];
-    assert.ok(job, `${name}: build job exists`);
-    assert.match(job, /uses: \.\/\.github\/workflows\/_build\.yml/, name);
-    assert.match(job, /secrets: inherit/, name);
-  }
+test('Android rehearsals inherit build secrets without invoking desktop signing or publication', () => {
+  const release = readFileSync(new URL('release.yml', directory), 'utf8');
+  const nightly = readFileSync(new URL('nightly.yml', directory), 'utf8');
+  assert.match(release, /uses: \.\/\.github\/workflows\/ci\.yml/);
+  assert.match(release, /uses: \.\/\.github\/workflows\/_tests\.yml/);
+  assert.match(nightly, /uses: \.\/\.github\/workflows\/android\.yml/);
+  assert.match(nightly, /publish: false/);
+  assert.match(nightly, /secrets: inherit/);
+  assert.doesNotMatch(release + nightly, /uses: .*\/_build\.yml|action-gh-release|app-store\.yml/);
 });
