@@ -3,6 +3,8 @@ pub mod connection;
 pub mod feedback;
 pub use feedback::*;
 pub mod launch_library;
+pub mod runtime;
+pub use runtime::{get_instance_runtime_status, instance_runtime_action};
 pub mod shared_storage;
 
 pub use self::auto_shutdown::{

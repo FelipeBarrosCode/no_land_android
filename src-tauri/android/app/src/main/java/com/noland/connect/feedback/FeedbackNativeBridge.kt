@@ -30,6 +30,10 @@ internal object FeedbackNativeBridge {
   private external fun nativeLifecycle(foreground: Boolean)
 
   private fun file(context: Context) = AtomicFile(File(context.noBackupFilesDir, "noland-feedback-v1/credentials.enc"))
+  // AtomicFile.exists() is not part of the public Android SDK. Include the
+  // legacy backup so readFully() can recover an interrupted atomic write.
+  private fun hasStoredBlob(target: AtomicFile) =
+    target.baseFile.exists() || File("${target.baseFile.path}.bak").exists()
   private fun accountFile(context: Context, service: String, account: String): AtomicFile {
     check(service.startsWith("noland-connect.state-secrets.v1.") && service.length <= 256)
     check(account.length in 1..256)
@@ -67,7 +71,7 @@ internal object FeedbackNativeBridge {
     val bytes = plaintext.toByteArray(Charsets.UTF_8)
     check(bytes.size <= 2097152) { "Protected value exceeds bounds" }
     val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-    val anyExistingBlob = target.exists() || target.baseFile.parentFile?.listFiles()?.any { it.name.endsWith(".enc") } == true
+    val anyExistingBlob = hasStoredBlob(target) || target.baseFile.parentFile?.listFiles()?.any { it.name.endsWith(".enc") } == true
     cipher.init(Cipher.ENCRYPT_MODE, key(anyExistingBlob, alias))
     cipher.updateAAD(aad(context, binding))
     check(cipher.iv.size == 12) { "Invalid Keystore nonce length" }
@@ -79,7 +83,7 @@ internal object FeedbackNativeBridge {
       stream.fd.sync()
       target.finishWrite(stream)
       val parent = android.system.Os.open(target.baseFile.parentFile!!.absolutePath,
-        android.system.OsConstants.O_RDONLY or android.system.OsConstants.O_DIRECTORY, 0)
+        android.system.OsConstants.O_RDONLY, 0)
       try { android.system.Os.fsync(parent) } finally { android.system.Os.close(parent) }
     } catch (error: Throwable) {
       target.failWrite(stream)
@@ -99,10 +103,10 @@ internal object FeedbackNativeBridge {
         // No identity, files, or key are created by local status on a fresh installation.
         store()
         Cipher.getInstance("AES/GCM/NoPadding")
-        if (target.exists()) decrypt(context, target.readFully())
+        if (hasStoredBlob(target)) decrypt(context, target.readFully())
         check(installed) { "Feedback lifecycle callbacks are not installed" }
       }
-      "read" -> if (target.exists()) response.put("value", decrypt(context, target.readFully()))
+      "read" -> if (hasStoredBlob(target)) response.put("value", decrypt(context, target.readFully()))
       "write" -> {
         val plaintext = request.getString("value")
         check(plaintext.toByteArray(Charsets.UTF_8).size <= 48000) { "Feedback credentials exceed bounds" }
@@ -115,7 +119,7 @@ internal object FeedbackNativeBridge {
         val binding = "$service\u0000$account"
         val alias = "${context.packageName}.state-secrets.aes-gcm.v1"
         when (request.getString("action")) {
-          "stateRead" -> if (accountTarget.exists()) response.put("value", decrypt(context, accountTarget.readFully(), binding, alias))
+          "stateRead" -> if (hasStoredBlob(accountTarget)) response.put("value", decrypt(context, accountTarget.readFully(), binding, alias))
           "stateWrite" -> write(context, accountTarget, request.getString("value"), binding, alias)
           "stateDelete" -> accountTarget.delete()
         }

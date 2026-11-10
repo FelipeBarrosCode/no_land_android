@@ -19,6 +19,11 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   # Public endpoint embedded by Rust option_env! at compile time.
   NOLAND_FEEDBACK_API_URL: ${{ secrets.NOLAND_FEEDBACK_API_URL }}
+  # Public, immutable Linux release pins; no signing private key belongs in this app.
+  NOLAND_RUNTIME_AGENT_URL: ${{ vars.NOLAND_RUNTIME_AGENT_URL }}
+  NOLAND_RUNTIME_AGENT_SHA256: ${{ vars.NOLAND_RUNTIME_AGENT_SHA256 }}
+  NOLAND_RUNTIME_MANIFEST_URL: ${{ vars.NOLAND_RUNTIME_MANIFEST_URL }}
+  NOLAND_RUNTIME_PUBLIC_KEY: ${{ vars.NOLAND_RUNTIME_PUBLIC_KEY }}
   JAVA_VERSION: "21"
   NODE_VERSION: "22"
   ANDROID_HOME: /usr/local/lib/android/sdk
@@ -131,6 +136,7 @@ jobs:
       - name: Validate Android source and shared frontend
         run: |
           npm run check:android
+          npm run test:runtime
           node --test scripts/android-toolchain.test.mjs
           npm run i18n:check
           npm run build

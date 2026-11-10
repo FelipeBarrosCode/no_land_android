@@ -30,6 +30,7 @@ tar = "0.4"
 tauri-build = { version = "2.0.0", features = [] }
 
 [dependencies]
+noland-runtime-contracts = { path = "../runtime-contracts" }
 noland-network-contracts = { path = "../network-contracts" }
 noland-rclone-adapter = { path = "../state-agent/crates/noland-rclone-adapter" }
 async-trait = "0.1.83"

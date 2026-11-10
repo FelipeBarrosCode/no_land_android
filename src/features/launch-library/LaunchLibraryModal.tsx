@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { RuntimePanel } from "../runtime/RuntimePanel";
 import { Button } from "../../components/ui/Button";
 import { ModalBody, ModalFrame } from "../../components/ui/ModalFrame";
 import { useLocalization, translate } from "../../lib/i18n";
@@ -128,6 +129,7 @@ export function LaunchLibraryModal({
       </div>
 
       <ModalBody className="p-5">
+        <RuntimePanel key={instanceId} instanceId={instanceId} onLibraryChanged={() => void onLoadLibrary(instanceId)} />
         <div className="mb-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           <LaunchPcCard
             available={library?.launchPcAvailable ?? true}
