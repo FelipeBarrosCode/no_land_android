@@ -3,6 +3,8 @@ pub mod connection;
 pub mod feedback;
 pub use feedback::*;
 pub mod launch_library;
+pub mod runtime;
+pub use runtime::{get_instance_runtime_status, instance_runtime_action};
 pub mod shared_storage;
 
 pub use self::auto_shutdown::{
@@ -2378,6 +2380,14 @@ pub async fn select_offer(
         )
     })?;
 
+    if storage_gb > selected.available_storage_gb.min(10000) {
+        return Err(AppError::InvalidInput(format!(
+            "Storage must be between 30GB and {}GB for this offer",
+            selected.available_storage_gb.min(10000)
+        ))
+        .into());
+    }
+
     let next_state = context
         .update_state(|state| {
             state.selected_offer = Some(selected);
@@ -3191,6 +3201,29 @@ pub async fn update_platform_credentials(
         .await?;
 
     Ok(next_state)
+}
+
+#[tauri::command]
+pub async fn apply_instance_desktop_password(
+    context: State<'_, AppContext>,
+    instance_id: u64,
+) -> Result<(), FrontendError> {
+    let guard = context.orchestration_guard.lock().await;
+    if *guard {
+        return Err(AppError::InvalidInput(
+            "Wait for provisioning to finish before changing a desktop password".into(),
+        )
+        .into());
+    }
+    InstanceLifecycleService::acquire_lock(instance_id, "desktop password update").await?;
+    let result = async {
+        let remote = build_remote_exec_for_instance(context.inner(), instance_id).await?;
+        crate::services::desktop_password::apply(context.inner(), &remote, instance_id).await
+    }
+    .await;
+    InstanceLifecycleService::release_lock(instance_id).await;
+    drop(guard);
+    result.map_err(Into::into)
 }
 
 #[tauri::command]

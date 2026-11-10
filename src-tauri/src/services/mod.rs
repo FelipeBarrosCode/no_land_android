@@ -8,6 +8,7 @@ pub mod audio_latency;
 pub mod clipboard;
 pub mod cloudflare_turn;
 pub mod connection_manager;
+pub mod desktop_password;
 pub mod diagnostics;
 pub mod display_profile;
 pub mod feedback;
@@ -34,8 +35,8 @@ pub mod orchestration;
 pub mod os_detection;
 mod package_manager;
 
-pub mod post_wireguard_setup;
 pub mod platform_credentials;
+pub mod post_wireguard_setup;
 pub mod reboot_helper;
 pub mod remote_display;
 #[cfg_attr(
@@ -43,6 +44,7 @@ pub mod remote_display;
     path = "remote_exec_ios.rs"
 )]
 pub mod remote_exec;
+pub mod runtime_manager;
 pub mod shared_storage;
 #[cfg_attr(target_os = "ios", path = "sleep_inhibit_ios.rs")]
 pub mod sleep_inhibit;
