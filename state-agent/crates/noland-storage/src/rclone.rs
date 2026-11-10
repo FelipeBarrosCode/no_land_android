@@ -132,7 +132,7 @@ impl RcloneCommandBuilder {
         // cat produces an ordered stream; copyto's multistream output may have holes.
         // Parallelism is across packs, with OS pipe backpressure instead of disk copies.
         let mut args = vec!["cat".into()];
-        self.push_backend_options(&mut args);
+        self.push_upload_options(&mut args);
         args.push(source);
         args
     }
@@ -1006,7 +1006,6 @@ impl SharedStorageProvider for RcloneStorage {
                 class: classify_remote_error(status.code(), &String::from_utf8_lossy(&tail)),
                 message: String::from_utf8_lossy(&tail).trim().to_string(),
             };
-            self.record_remote_error(failure.class);
             if failure.class.is_retryable() && attempt < self.tuning.max_attempts.max(1) {
                 self.retry_gate.wait_for_retry(attempt, failure.class).await;
             } else {

@@ -243,6 +243,40 @@ pub fn provider_arg_is_allowed(provider: ProviderKind, arg: &str) -> bool {
     }
 }
 
+/// Prevent backend-specific flags from leaking into another provider's stream.
+pub fn provider_arg_is_allowed(provider: ProviderKind, arg: &str) -> bool {
+    if arg.starts_with("--s3-") {
+        matches!(
+            provider,
+            ProviderKind::AmazonS3
+                | ProviderKind::CloudflareR2
+                | ProviderKind::Wasabi
+                | ProviderKind::DigitalOceanSpaces
+                | ProviderKind::GenericS3
+        )
+    } else if arg.starts_with("--b2-") {
+        provider == ProviderKind::BackblazeB2
+    } else if arg.starts_with("--drive-") {
+        provider == ProviderKind::GoogleDrive
+    } else if arg.starts_with("--gcs-") {
+        provider == ProviderKind::GoogleCloudStorage
+    } else if arg.starts_with("--onedrive-") {
+        provider == ProviderKind::MicrosoftOneDrive
+    } else if arg.starts_with("--dropbox-") {
+        provider == ProviderKind::Dropbox
+    } else if arg.starts_with("--box-") {
+        provider == ProviderKind::Box
+    } else if arg.starts_with("--azureblob-") {
+        provider == ProviderKind::AzureBlob
+    } else if arg.starts_with("--sftp-") {
+        provider == ProviderKind::Sftp
+    } else if arg.starts_with("--webdav-") {
+        provider == ProviderKind::Webdav
+    } else {
+        true
+    }
+}
+
 pub fn configured_backend_type<'a>(config_ini: &'a str, remote_name: &str) -> Option<&'a str> {
     let wanted_section = format!("[{remote_name}]");
     let mut in_section = false;
