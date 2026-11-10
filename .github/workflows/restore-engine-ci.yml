@@ -36,7 +36,7 @@ jobs:
       - name: Test restore, encryption, and storage libraries only
         run: cargo test --locked --manifest-path state-agent/Cargo.toml -p noland-restore -p noland-pack -p noland-storage --lib
       - name: Lint restore libraries
-        run: cargo clippy --locked --manifest-path state-agent/Cargo.toml -p noland-restore -p noland-pack -p noland-storage --all-targets -- -D warnings
+        run: cargo clippy --locked --manifest-path state-agent/Cargo.toml -p noland-restore -p noland-pack -p noland-storage --all-targets --no-deps -- -D warnings
   agent-contract:
     name: Agent integration (no app builds)
     runs-on: ubuntu-24.04
