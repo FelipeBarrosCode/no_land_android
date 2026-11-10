@@ -7,9 +7,21 @@ on:
     tags:
       - "android-v*"
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish validated preview APKs to GitHub Releases
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      publish:
+        description: Publish artifacts (nightly rehearsals must keep this false)
+        type: boolean
+        default: false
 
 permissions:
-  contents: write
+  contents: read
+  security-events: write
 
 concurrency:
   group: android-${{ github.workflow }}-${{ github.ref }}
@@ -34,6 +46,10 @@ env:
   ANDROID_CMAKE_VERSION: "3.22.1"
 
 jobs:
+  validation:
+    if: github.event_name != 'pull_request'
+    uses: ./.github/workflows/release.yml
+
   version:
     name: Determine mobile release version
     runs-on: ubuntu-24.04
@@ -66,7 +82,10 @@ jobs:
 
   build:
     name: Build ${{ matrix.abi }} debug APK
-    needs: version
+    needs: [version, validation]
+    if: >-
+      always() && needs.version.result == 'success' &&
+      (needs.validation.result == 'success' || github.event_name == 'pull_request')
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
@@ -167,9 +186,10 @@ jobs:
   preview-release:
     name: Publish versioned Android preview
     if: >-
+      (github.event_name == 'push' || inputs.publish) &&
       github.event_name != 'pull_request' &&
       (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/android-v') || github.event_name == 'workflow_dispatch')
-    needs: [version, build]
+    needs: [version, validation, build]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

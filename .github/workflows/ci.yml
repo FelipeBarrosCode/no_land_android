@@ -3,15 +3,32 @@ name: Pull Request CI
 on:
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: pr-ci-${{ github.event.pull_request.number || github.ref }}
+  group: shared-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  script-tests:
+    name: Script regressions (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run test:scripts
+
   typecheck-build:
     name: typecheck-build
     runs-on: ubuntu-24.04
@@ -22,6 +39,8 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - name: Validate all localization bundles
+        run: npm run i18n:check
       - name: Verify feedback API build configuration
         run: node --test scripts/feedback-build-env.test.mjs
       - name: TypeScript and Vite production build
@@ -40,7 +59,7 @@ jobs:
           components: rustfmt
       - name: Check every first-party Rust workspace
         run: |
-          for manifest in network-contracts/Cargo.toml network-agent/Cargo.toml state-agent/Cargo.toml src-tauri/Cargo.toml mic-sidecar/Cargo.toml vm-cloud-mic-agent/Cargo.toml; do
+          for manifest in network-contracts/Cargo.toml network-agent/Cargo.toml state-agent/Cargo.toml src-tauri/Cargo.toml mic-sidecar/Cargo.toml vm-cloud-mic-agent/Cargo.toml runtime-contracts/Cargo.toml; do
             cargo fmt --all --manifest-path "$manifest" -- --check
           done
 
@@ -137,8 +156,6 @@ jobs:
             network-contracts
             network-agent
       - run: npm ci
-      - name: No-build Sunshine and CI regression tests
-        run: node --test scripts/sunshine-auth.test.mjs scripts/ci/*.test.mjs
       - run: npm run test:unit
 
   security:
@@ -153,7 +170,7 @@ jobs:
   required:
     name: PR CI required
     if: always()
-    needs: [typecheck-build, rust-format, rust-check, unit-tests, security]
+    needs: [script-tests, typecheck-build, rust-format, rust-check, unit-tests, security]
     runs-on: ubuntu-24.04
     steps:
       - name: Require every PR lane

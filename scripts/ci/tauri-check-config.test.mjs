@@ -37,3 +37,9 @@ test('shipping bundles still require their real resources and remote-agent sourc
   assert.ok(shipping.bundle.resources.length > 0);
   assert.ok(shipping.bundle.resources.includes('../state-agent/crates/**/*'));
 });
+
+test('host unit tests do not depend on release-only resource archives', () => {
+  const suite = readFileSync(new URL('../../.github/workflows/_tests.yml', import.meta.url), 'utf8');
+  assert.match(suite, /TAURI_CONFIG: '\{"bundle":\{"resources":\[\]\}\}'/);
+  assert.match(suite, /cargo test --locked --manifest-path src-tauri\/Cargo.toml --workspace --all-targets/);
+});

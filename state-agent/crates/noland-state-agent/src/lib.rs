@@ -122,6 +122,12 @@ impl StateAgent {
                 "interrupted restore rollback failed; retaining recovery artifacts"
             );
         }
+        if !restore_recovery.failures.is_empty() {
+            return Err(StateError::Invalid(format!(
+                "{} interrupted restore(s) could not be recovered; refusing new operations and retaining recovery artifacts",
+                restore_recovery.failures.len()
+            )));
+        }
         for mut op in self.db.unfinished_operations()? {
             let journal = self.db.sync_journal_summary(op.operation_id)?;
             let has_retry = matches!(op.kind.as_str(), "backup" | "restore");
@@ -185,6 +191,22 @@ impl StateAgent {
                     .add_known_root(&app.app_id, "install", &root.to_string_lossy())?;
             }
             Metrics::inc(&self.metrics.apps_discovered_total);
+        }
+        // Process observation sees paths inside the runtime's mount namespace.
+        // Repair indexed identities without changing their IDs or prior backup history.
+        for mut app in self.db.list_apps()? {
+            if let Some(executable) = app.canonical_executable.as_deref() {
+                if let Some(host_path) =
+                    noland_discovery::resolve_runtime_executable(&self.config.home, executable)
+                {
+                    app.canonical_executable = Some(host_path);
+                    self.db.upsert_app(&app)?;
+                }
+            }
+            if let Some(root) = derive_owned_install_root(&self.config.home, &app) {
+                self.db
+                    .add_known_root(&app.app_id, "install", &root.to_string_lossy())?;
+            }
         }
         *self.steam.lock() = scan.steam.clone();
         if let Some(steam) = &scan.steam {
@@ -491,6 +513,21 @@ mod tests {
     }
 
     #[test]
+    fn recover_refuses_corrupt_restore_journal_without_deleting_it() {
+        let root = test_root("recover-corrupt-restore");
+        let agent = StateAgent::boot(AgentConfig::isolated(root.clone())).unwrap();
+        let workspace = agent.config.paths.restore_dir(&Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&workspace).unwrap();
+        let journal = workspace.join("restore-transaction.json");
+        let malformed = b"{preserve-this-corrupt-journal";
+        std::fs::write(&journal, malformed).unwrap();
+        assert!(agent.recover().is_err());
+        assert_eq!(std::fs::read(journal).unwrap(), malformed);
+        drop(agent);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn recover_preserves_unfinished_operations_as_interrupted() {
         let root = test_root("recover");
         let agent = StateAgent::boot(AgentConfig::isolated(root.clone())).unwrap();
@@ -695,6 +732,42 @@ mod tests {
             AppId::steam(6060)
         );
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discovery_repairs_runtime_identity_and_reconciles_its_game_files() {
+        let root = test_root("runtime-owned-root");
+        let agent = StateAgent::boot(AgentConfig::isolated(root.clone())).unwrap();
+        let game = agent
+            .config
+            .home
+            .join(".local/share/noland-runtime/app-data/private-app/Games/Hookshot");
+        std::fs::create_dir_all(game.join("bin")).unwrap();
+        std::fs::write(game.join("bin/hookshot"), b"executable").unwrap();
+        std::fs::write(game.join("game.data"), b"assets").unwrap();
+        let identity = noland_discovery::fallback_exe_identity(std::path::Path::new(
+            "/home/runtime/Games/Hookshot/bin/hookshot",
+        ));
+        agent.db.upsert_app(&identity).unwrap();
+        agent.discover().unwrap();
+        let repaired = agent.db.get_app(&identity.app_id).unwrap().unwrap();
+        assert_eq!(
+            repaired.canonical_executable,
+            Some(std::fs::canonicalize(game.join("bin/hookshot")).unwrap())
+        );
+        assert!(agent
+            .db
+            .known_roots(Some(&identity.app_id))
+            .unwrap()
+            .iter()
+            .any(|(_, kind, path)| kind == "install"
+                && PathBuf::from(path) == std::fs::canonicalize(&game).unwrap()));
+        reconcile::reconcile_app_for_complete_backup(&agent, &identity.app_id).unwrap();
+        let files = agent.db.associations_for_app(&identity.app_id).unwrap();
+        assert!(files
+            .iter()
+            .any(|(path, _)| PathBuf::from(&path.canonical_path) == game.join("game.data")));
         let _ = std::fs::remove_dir_all(root);
     }
 

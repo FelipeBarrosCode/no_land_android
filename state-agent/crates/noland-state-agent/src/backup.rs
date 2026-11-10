@@ -10,7 +10,9 @@ use noland_cas::{chunk_file_streaming, LocalCas};
 use noland_classifier::Classifier;
 use noland_crypto::MasterKey;
 use noland_pack::{pack_chunk_files_with_limits, BuiltPack, PackIndexEntry};
-use noland_rclone_adapter::{EphemeralRcloneSession, ProviderRootIdentity, TransferTuning};
+use noland_rclone_adapter::{
+    EphemeralRcloneSession, ProviderKind, ProviderRootIdentity, TransferTuning, TransferWorkload,
+};
 use noland_snapshot::{create_view, discard};
 use noland_state_core::*;
 use noland_storage::{
@@ -1621,7 +1623,7 @@ pub async fn run_backup_with_session_performance(
 ) -> Result<BundleManifest> {
     let (config_path, _session_guard) =
         write_guarded_ephemeral_session(&agent.config.paths.run_root, session)?;
-    let tuning = transfer_tuning(agent, performance);
+    let tuning = transfer_tuning(agent, performance, session);
     let storage =
         RcloneStorage::try_from_session(session, &config_path)?.with_transfer_tuning(tuning);
     run_backup(
@@ -1663,7 +1665,7 @@ pub async fn run_backup_all_with_session_performance(
 ) -> Result<Vec<BundleManifest>> {
     let (config_path, _session_guard) =
         write_guarded_ephemeral_session(&agent.config.paths.run_root, session)?;
-    let tuning = transfer_tuning(agent, performance);
+    let tuning = transfer_tuning(agent, performance, session);
     let storage =
         RcloneStorage::try_from_session(session, &config_path)?.with_transfer_tuning(tuning);
     run_backup_all(agent, mode, performance, &storage, master, operation_id).await
@@ -1736,18 +1738,44 @@ fn restore_mode_for_backup(mode: BackupMode) -> RestoreMode {
     }
 }
 
-fn transfer_tuning(agent: &StateAgent, performance: BackupPerformanceMode) -> TransferTuning {
+fn transfer_tuning(
+    agent: &StateAgent,
+    performance: BackupPerformanceMode,
+    session: &EphemeralRcloneSession,
+) -> TransferTuning {
+    let provider = ProviderKind::parse(&session.provider).unwrap_or(ProviderKind::Local);
     if agent
         .db
         .open_session_app_ids()
         .is_ok_and(|sessions| !sessions.is_empty())
     {
-        return TransferTuning::gameplay_safe();
+        let tuning = TransferTuning::automatic(provider, TransferWorkload::GameplaySafe);
+        log_transfer_tuning(provider, TransferWorkload::GameplaySafe, &tuning);
+        return tuning;
     }
-    match performance {
-        BackupPerformanceMode::Fast | BackupPerformanceMode::Full => TransferTuning::throughput(),
-        BackupPerformanceMode::Balanced => TransferTuning::default(),
-    }
+    let workload = match performance {
+        BackupPerformanceMode::Fast | BackupPerformanceMode::Full => TransferWorkload::Throughput,
+        BackupPerformanceMode::Balanced => TransferWorkload::Balanced,
+    };
+    let tuning = TransferTuning::automatic(provider, workload);
+    log_transfer_tuning(provider, workload, &tuning);
+    tuning
+}
+
+fn log_transfer_tuning(
+    provider: ProviderKind,
+    workload: TransferWorkload,
+    tuning: &TransferTuning,
+) {
+    tracing::info!(
+        provider = provider.as_str(),
+        ?workload,
+        uploads = tuning.max_parallel_uploads,
+        downloads = tuning.max_parallel_downloads,
+        rclone_transfers = tuning.rclone_transfers,
+        rclone_checkers = tuning.rclone_checkers,
+        "resolved automatic shared-storage parallelism"
+    );
 }
 
 #[cfg(test)]
@@ -1860,6 +1888,86 @@ mod tests {
                 false,
             )
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn personal_backup_excludes_dated_server_logs_and_keeps_saves() {
+        let root = test_root("dated-server-log-exclusion");
+        let agent = StateAgent::boot(AgentConfig::isolated(root.clone())).unwrap();
+        let app = AppIdentity::new(AppId::desktop("test-game"), "Test Game");
+        agent.db.upsert_app(&app).unwrap();
+        let log = agent
+            .config
+            .home
+            .join("server/logs/localhost_access_log.2026-11-09.txt");
+        let save = agent.config.home.join("game/user/save/progress.sav");
+        for (path, bytes) in [
+            (&log, b"diagnostic".as_slice()),
+            (&save, b"save data".as_slice()),
+        ] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+            associate_path(&agent, &app.app_id, path, EvidenceKind::DirectCgroupWrite);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let manifest = run_backup_to_local(
+            &agent,
+            &app.app_id,
+            BackupMode::PersonalState,
+            root.join("cloud"),
+            &MasterKey::generate(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(manifest.files.len(), 1);
+        assert_eq!(
+            manifest.files[0].source_path_hint.as_deref(),
+            Some(save.to_string_lossy().as_ref())
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn complete_backup_includes_private_runtime_application_files() {
+        let root = test_root("private-runtime-complete");
+        let agent = StateAgent::boot(AgentConfig::isolated(root.clone())).unwrap();
+        let game = agent
+            .config
+            .home
+            .join(".local/share/noland-runtime/app-data/runtime-app/Games/Hookshot");
+        std::fs::create_dir_all(game.join("bin")).unwrap();
+        std::fs::write(game.join("bin/hookshot"), b"executable").unwrap();
+        std::fs::write(game.join("game.data"), b"game assets").unwrap();
+        let other = agent
+            .config
+            .home
+            .join(".local/share/noland-runtime/app-data/other-app/Games/Other/private.dat");
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&other, b"other app").unwrap();
+        let app = noland_discovery::fallback_exe_identity(Path::new(
+            "/home/runtime/Games/Hookshot/bin/hookshot",
+        ));
+        agent.db.upsert_app(&app).unwrap();
+        agent.discover().unwrap();
+        let manifest = run_backup_to_local(
+            &agent,
+            &app.app_id,
+            BackupMode::CompleteApplication,
+            root.join("cloud"),
+            &MasterKey::generate(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(manifest.files.len(), 2);
+        assert!(manifest.files.iter().all(|file| file
+            .source_path_hint
+            .as_deref()
+            .is_some_and(|path| Path::new(path).starts_with(&game))));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
