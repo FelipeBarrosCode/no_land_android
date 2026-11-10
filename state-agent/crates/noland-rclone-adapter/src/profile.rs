@@ -189,7 +189,7 @@ pub fn validate_provider_backend(provider: ProviderKind, backend_type: &str) -> 
 }
 
 fn format_size_mib(bytes: u64) -> Result<String> {
-    if bytes == 0 || bytes % MIB != 0 {
+    if bytes == 0 || !bytes.is_multiple_of(MIB) {
         return Err(AdapterError::Invalid(format!(
             "rclone transfer size {bytes} is not a positive whole MiB"
         )));
