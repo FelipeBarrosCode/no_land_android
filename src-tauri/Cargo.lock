@@ -3419,7 +3419,10 @@ dependencies = [
 name = "noland-rclone-adapter"
 version = "0.1.0"
 dependencies = [
+ "aes 0.8.4",
+ "base64 0.22.1",
  "chrono",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
