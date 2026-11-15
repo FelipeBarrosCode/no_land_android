@@ -398,10 +398,18 @@ test("UI source safety and integration guards (not browser interaction tests)", 
   assert.match(source("src/app/App.tsx"), /<FeedbackProvider persistedState=\{appState\?\.feedbackProgram\}>/);
 });
 
-test("destroy store reports failure to the real confirmation without changing generic task or provider selection semantics", () => {
+test("destroy store reports failure without changing foreground task or provider selection semantics", () => {
   const path = "src/store/appStore.ts";
   const baseline = execFileSync("git", ["--no-pager", "show", `HEAD:${path}`], { cwd: root, encoding: "utf8" });
-  assert.equal(findInitializer(source(path), "runInstanceTask", ts.ScriptKind.TS), findInitializer(baseline, "runInstanceTask", ts.ScriptKind.TS));
+  // Shared Storage intentionally adds request-scoped background monitoring.
+  // Destroy is foreground: preserve its original success/failure/finally path,
+  // rather than freezing unrelated background handling to the HEAD snapshot.
+  const foreground = (text) => {
+    const start = text.lastIndexOf("\n    try {\n      return await task();");
+    assert.ok(start >= 0, "foreground task execution branch exists");
+    return text.slice(start);
+  };
+  assert.equal(foreground(findInitializer(source(path), "runInstanceTask", ts.ScriptKind.TS)), foreground(findInitializer(baseline, "runInstanceTask", ts.ScriptKind.TS)));
   const completed = findInitializer(source(path), "completed", ts.ScriptKind.TS);
   assert.match(completed, /await destroyInstance\(instanceId\)/);
   assert.match(completed, /return true/);

@@ -62,7 +62,7 @@ export function DestroyFeedbackConfirmation({ instance, disabled, onDestroy, onC
         destroy: onDestroy,
       });
       invalidateFeedbackData();
-      // If native backup/deletion failed, the rental remains and this confirmation/durable draft remains retryable.
+      // If provider deletion failed, the rental and durable draft remain retryable.
     } catch {
       setError(translate("feedback.538083716511788a"));
     } finally { inFlight.current = false; setSaving(false); }
@@ -71,7 +71,7 @@ export function DestroyFeedbackConfirmation({ instance, disabled, onDestroy, onC
   return (
     <section className="feedback-ui space-y-3 rounded border border-red-400/60 bg-red-950/25 p-3 text-[#eddaeb]" aria-labelledby={`${id}-title`}>
       <h4 id={`${id}-title`} className="font-semibold text-red-200">{translate("feedback.8d573f8b7e381a39")} {instance.instanceId}?</h4>
-      <p>{translate("feedback.2ade73bb98ac1b84")}</p>
+      <p>{translate("instance.destroy.noBackup")}</p>
       {scope && providerInstanceId && !eligibility && <p role="status">{translate("feedback.9c75f76a870e62ca")}</p>}
       {eligible && !saved && <fieldset className="space-y-3" disabled={disabled || saving}>
         <legend className="font-semibold text-white">{translate("feedback.9cef2ccf592b9212")}</legend>

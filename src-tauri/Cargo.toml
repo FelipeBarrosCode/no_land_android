@@ -33,6 +33,9 @@ tauri-build = { version = "2.0.0", features = [] }
 noland-runtime-contracts = { path = "../runtime-contracts" }
 noland-network-contracts = { path = "../network-contracts" }
 noland-rclone-adapter = { path = "../state-agent/crates/noland-rclone-adapter" }
+noland-crypto = { path = "../state-agent/crates/noland-crypto" }
+noland-state-core = { path = "../state-agent/crates/noland-state-core" }
+noland-storage = { path = "../state-agent/crates/noland-storage" }
 async-trait = "0.1.83"
 aes = "0.8.4"
 base64 = "0.22.1"

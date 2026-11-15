@@ -1,5 +1,10 @@
 pub mod agent_handoff;
 pub mod agent_runtime;
+pub mod browse;
+mod browse_cache;
+mod deletion;
+mod operation_monitor;
+mod operation_submission;
 
 pub mod oauth_flow;
 pub mod object_storage;
