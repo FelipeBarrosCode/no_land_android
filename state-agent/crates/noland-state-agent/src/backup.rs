@@ -33,6 +33,8 @@ mod cache;
 mod capture_pipeline;
 mod group;
 #[cfg(test)]
+mod metadata_tests;
+#[cfg(test)]
 mod optimizations;
 mod packing;
 mod preparation;
@@ -558,9 +560,38 @@ fn capture_symlink(
     Ok((file, state))
 }
 
+fn hash_pool_limits(
+    requested: usize,
+    jobs: usize,
+    current: preparation::Budget,
+) -> Result<(usize, usize)> {
+    if requested == 0 || current.hashing == 0 || current.packing == 0 {
+        return Err(StateError::Integrity(
+            "invalid hashing worker budget".into(),
+        ));
+    }
+    // Re-admit only the reader share, not a fresh whole preparation allowance.
+    // The caller's gameplay/benchmark lowering remains an immutable upper bound.
+    let workers = preparation::Budget {
+        hashing: requested,
+        packing: 1,
+    }
+    .admitted(current)
+    .hashing
+    .min(jobs);
+    let capacity = workers
+        .checked_mul(2)
+        .ok_or_else(|| StateError::Invalid("hash worker channel capacity overflow".into()))?;
+    Ok((workers, capacity))
+}
+
+// Keep frozen requested width and fresh admission explicit, independently of
+// the owned cache inputs and cancellation/completion callbacks.
+#[allow(clippy::too_many_arguments)]
 fn hash_files_parallel(
     jobs: Vec<HashJob>,
     worker_count: usize,
+    current: preparation::Budget,
     cas: Arc<CasLease>,
     inherited_hashes: std::collections::HashSet<String>,
     remote_chunks: RemoteChunkIndex,
@@ -573,9 +604,15 @@ fn hash_files_parallel(
         mpsc, Arc, Mutex,
     };
 
-    let worker_count = worker_count.max(1);
-    let (job_tx, job_rx) = mpsc::sync_channel::<HashJob>(worker_count * 2);
-    let (result_tx, result_rx) = mpsc::sync_channel::<Result<HashResult>>(worker_count * 2);
+    let (worker_count, capacity) = hash_pool_limits(worker_count, jobs.len(), current)?;
+    if cancelled() {
+        return Err(cancellation_error());
+    }
+    if worker_count == 0 {
+        return Ok(());
+    }
+    let (job_tx, job_rx) = mpsc::sync_channel::<HashJob>(capacity);
+    let (result_tx, result_rx) = mpsc::sync_channel::<Result<HashResult>>(capacity);
     let job_rx = Arc::new(Mutex::new(job_rx));
     let inherited_hashes = Arc::new(inherited_hashes);
     let remote_chunks = Arc::new(remote_chunks);
@@ -745,13 +782,14 @@ pub async fn run_backup(
 ) -> Result<BundleManifest> {
     let id = operation_id.unwrap_or_else(Uuid::new_v4);
     let before = provider.operation_metrics();
-    let repository_guard = crate::repository::acquire(agent, provider, master, id).await?;
+    let metadata_before = provider.metadata_read_metrics();
     let mut network = agent
         .db
         .get_operation(id)?
         .as_ref()
         .map(operation_metrics)
         .unwrap_or_default();
+    let repository_guard = crate::repository::acquire(agent, provider, master, id).await?;
     let result = async {
         let retired = noland_storage::retired_pack_ids(provider, master).await?;
         if let Some(binding) = repository_cache_binding(provider.storage_identity(), master) {
@@ -763,9 +801,10 @@ pub async fn run_backup(
         run_backup_inner(agent, app_id, mode, performance, provider, master, Some(id)).await
     }
     .await;
-    if let Err(error) = repository_guard.release().await {
-        tracing::warn!(%error, "repository admission cleanup requires owner recovery");
-    }
+    let _finalization = result
+        .is_ok()
+        .then(|| agent.operations.finalization_scope(id));
+    let result = repository_guard.finish(result).await;
     apply_storage_metrics(
         &mut network,
         provider.operation_metrics().saturating_sub(before),
@@ -784,12 +823,18 @@ pub async fn run_backup(
         metrics.num_remote_upload_calls = network.num_remote_upload_calls;
         metrics.num_remote_download_calls = network.num_remote_download_calls;
         operation.detail_json["metrics"] = serde_json::to_value(&metrics)?;
+        operation.detail_json["remote_metadata"] = serde_json::json!({
+            "provider_io": provider.metadata_read_metrics().saturating_sub(metadata_before),
+        });
         agent.db.set_operation_metrics(id, &metrics)?;
         agent.db.upsert_operation(&operation)
     })();
     if let Err(error) = persist {
         // Never replace the original transfer error with a metrics-write error.
         tracing::warn!(%error, operation_id = %id, "could not persist complete backup network accounting");
+    }
+    if result.is_ok() {
+        crate::operation_diagnostics::complete_after_repository_release(agent, id)?;
     }
     result
 }
@@ -830,8 +875,17 @@ async fn run_backup_inner(
                 "backup retry cache policy differs from its captured revision".into(),
             ));
         }
-        return finish_prepared_backup(agent, provider, master, op, prepared, total_started, true)
-            .await;
+        return finish_prepared_backup(
+            agent,
+            provider,
+            master,
+            op,
+            prepared,
+            total_started,
+            true,
+            performance,
+        )
+        .await;
     }
     persist_operation(agent, &mut op, BackupState::Discovering, &metrics)?;
 
@@ -866,9 +920,20 @@ async fn run_backup_inner(
         .unwrap_or(0);
     metrics.num_dirty_roots = agent.db.list_dirty_roots(Some(app_id))?.len() as u64;
 
+    let parent_started = Instant::now();
     let parent = load_parent(provider, master, agent, app_id).await;
+    op.detail_json["catalog"] = serde_json::json!({
+        "parent_load_duration_ms": elapsed_ms(parent_started),
+    });
     if mode == BackupMode::CompleteApplication {
-        let catalog = noland_storage::load_catalog(provider, master).await?;
+        let catalog_started = Instant::now();
+        let catalog = noland_storage::load_catalog(provider, master).await;
+        op.detail_json["catalog"]["load_catalog_duration_ms"] =
+            serde_json::json!(elapsed_ms(catalog_started));
+        // Persist even a failed browse; terminal handlers cannot reconstruct
+        // time spent awaiting an unavailable/authentication-failing provider.
+        agent.db.upsert_operation(&op)?;
+        let catalog = catalog?;
         if let Some(current) = catalog.apps.iter().find(|app| app.app_id == *app_id) {
             if parent
                 .as_ref()
@@ -1587,14 +1652,25 @@ async fn run_backup_inner(
             std::fs::File::open(&agent.config.paths.snapshots)?.sync_all()?;
         }
         write_prepared_backup(agent, master, op_id, &prepared)?;
-        return finish_prepared_backup(agent, provider, master, op, prepared, total_started, false)
-            .await;
+        return finish_prepared_backup(
+            agent,
+            provider,
+            master,
+            op,
+            prepared,
+            total_started,
+            false,
+            performance,
+        )
+        .await;
     }
     let mut new_chunk_paths = BTreeMap::<String, ChunkSource>::new();
     let mut small_file_chunk_hashes = BTreeSet::<String>::new();
+    let current = preparation::Budget::detect(agent, performance)?;
     hash_files_parallel(
         jobs,
         preparation_budget.hashing,
+        current,
         Arc::clone(&cas_lease),
         inherited_hashes,
         remote_chunks,
@@ -1745,7 +1821,17 @@ async fn run_backup_inner(
     if prepared.storage_id.is_some() {
         cas_lease.retain_for_retry();
     }
-    finish_prepared_backup(agent, provider, master, op, prepared, total_started, false).await
+    finish_prepared_backup(
+        agent,
+        provider,
+        master,
+        op,
+        prepared,
+        total_started,
+        false,
+        performance,
+    )
+    .await
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1873,6 +1959,9 @@ fn read_prepared_backup(
     Ok(Some(prepared))
 }
 
+// Keep current performance explicit alongside dependencies and frozen operation
+// state: replay must not recover its live admission policy from the checkpoint.
+#[allow(clippy::too_many_arguments)]
 async fn finish_prepared_backup(
     agent: &StateAgent,
     provider: &dyn SharedStorageProvider,
@@ -1881,6 +1970,7 @@ async fn finish_prepared_backup(
     mut prepared: PreparedBackup,
     total_started: Instant,
     resumed: bool,
+    performance: BackupPerformanceMode,
 ) -> Result<BundleManifest> {
     if agent.operations.cancel_requested(op.operation_id) {
         return Err(cancellation_error());
@@ -1919,7 +2009,19 @@ async fn finish_prepared_backup(
             }
         }
     }
-    capture_pipeline::run(agent, provider, master, op.operation_id, &mut prepared).await?;
+    // Resolve after repository checks, immediately before allocating any worker
+    // pools. Both first-finish and replay retain the caller's CURRENT mode, game
+    // and IO profile; saved counts must not replace Balanced with Automatic.
+    let current = preparation::Budget::detect(agent, performance)?;
+    capture_pipeline::run(
+        agent,
+        provider,
+        master,
+        op.operation_id,
+        &mut prepared,
+        current,
+    )
+    .await?;
     packing::pack_and_upload(
         agent,
         provider,
@@ -1927,6 +2029,7 @@ async fn finish_prepared_backup(
         op.operation_id,
         &mut prepared,
         resumed,
+        current,
     )
     .await?;
     if agent.operations.cancel_requested(op.operation_id) {
@@ -2025,16 +2128,20 @@ async fn finish_prepared_backup(
     persist_operation(agent, &mut op, BackupState::Committing, &metrics)?;
     report_commit_progress(agent, op_id, &pack_files, resumed)?;
     let commit_started = Instant::now();
-    update_catalog_with_bundle(provider, master, &manifest, incremental).await?;
+    let publication = update_catalog_with_bundle(provider, master, &manifest, incremental).await;
+    crate::cloud_catalog::invalidate(agent, provider.storage_identity(), master);
+    publication?;
     if manifest.mode == BackupMode::CompleteApplication {
-        noland_storage::converge_application(
+        let convergence = noland_storage::converge_application(
             provider,
             master,
             &manifest,
             op_id,
             &crate::repository::owner(agent, master)?,
         )
-        .await?;
+        .await;
+        crate::cloud_catalog::invalidate(agent, provider.storage_identity(), master);
+        convergence?;
     }
     let cache_binding = repository_cache_binding(provider.storage_identity(), master);
     cache_parent(
@@ -2096,6 +2203,7 @@ async fn finish_prepared_backup(
 
     metrics.total_duration_ms =
         elapsed_ms(total_started).saturating_add(metrics.discovery_duration_ms);
+    crate::operation_diagnostics::retain(agent, &mut op)?;
     if let Some(pipeline) = agent
         .db
         .get_operation_progress(op_id)?
@@ -2115,8 +2223,13 @@ async fn finish_prepared_backup(
     if let Some(error) = checkpoint_error {
         detail.insert("checkpoint_error".into(), serde_json::json!(error));
     }
-    agent.db.set_operation_progress(op_id, None)?;
-    persist_operation(agent, &mut op, BackupState::Completed, &metrics)?;
+    persist_operation(agent, &mut op, BackupState::Committing, &metrics)?;
+    crate::operation_diagnostics::prepare_completion(
+        agent,
+        op_id,
+        BackupState::Committing.as_str(),
+        BackupState::Completed.as_str(),
+    )?;
     pack_cleanup.mark_cloud_committed();
     match std::fs::remove_file(prepared_backup_path(agent, op_id)) {
         Ok(()) => {}
@@ -2190,6 +2303,16 @@ async fn load_parent(
     }
     let binding = repository_cache_binding(provider.storage_identity(), master);
     if let Some(cached) = read_cached_parent(agent, app_id, bundle_id, binding.as_deref(), master) {
+        // A locally authenticated parent is not proof that its remote commit
+        // still exists (e.g. external retirement without a local DB update).
+        provider
+            .stat(&noland_storage::RemoteKey::new(format!(
+                "{}/{}",
+                bundle_dir(app_id, bundle_id),
+                COMMITTED_MARKER,
+            )))
+            .await
+            .ok()??;
         let _ = remember_remote_pack_index(agent, provider.storage_identity(), master, &cached.1);
         return Some(cached);
     }
@@ -2208,17 +2331,94 @@ fn repository_cache_binding(
     identity: Option<ProviderRootIdentity>,
     master: &MasterKey,
 ) -> Option<String> {
-    let identity = identity?;
-    // Opaque, domain-separated cache scope; neither the key nor credentials are
-    // persisted. Reuse must match both the remote namespace and the vault key.
-    Some(
-        blake3::keyed_hash(
-            &master.0,
-            format!("noland-cache-v1:{}", identity.cache_key()).as_bytes(),
-        )
-        .to_hex()
-        .to_string(),
+    crate::storage_scope::binding(identity, master)
+}
+
+/// Metadata hints can save large index/manifest transfers, never current
+/// visibility checks. The restore caller holds repository admission throughout.
+pub(crate) async fn read_restore_metadata(
+    agent: &StateAgent,
+    provider: &dyn SharedStorageProvider,
+    master: &MasterKey,
+    app_id: &AppId,
+    bundle_id: Uuid,
+    operation_id: Uuid,
+) -> Result<(BundleManifest, Vec<PackIndexEntry>, serde_json::Value)> {
+    use noland_storage::RemoteKey;
+    let started = Instant::now();
+    let binding = repository_cache_binding(provider.storage_identity(), master);
+    let cached = read_cached_parent(agent, app_id, bundle_id, binding.as_deref(), master);
+    let cache_ms = elapsed_ms(started);
+    let remote_started = Instant::now();
+    if let Some((manifest, index)) = cached {
+        let prefix = bundle_dir(app_id, bundle_id);
+        let marker_key = RemoteKey::new(format!("{prefix}/{COMMITTED_MARKER}"));
+        let (deleted, marker) = tokio::try_join!(
+            noland_storage::bundle_is_deleted(provider, master, bundle_id),
+            provider.stat(&marker_key),
+        )?;
+        if deleted {
+            return Err(StateError::NotFound("backup was explicitly deleted".into()));
+        }
+        if marker.is_none() {
+            return Err(StateError::IncompleteCommit);
+        }
+        let manifest_key = RemoteKey::new(format!("{prefix}/manifest.enc"));
+        let index_key = RemoteKey::new(format!("{prefix}/index.enc"));
+        let (remote_manifest, remote_index) =
+            tokio::try_join!(provider.stat(&manifest_key), provider.stat(&index_key))?;
+        if remote_manifest.is_none() || remote_index.is_none() {
+            return Err(StateError::IncompleteCommit);
+        }
+        // A retry can hit metadata authenticated by an earlier attempt. Resolve
+        // its old failed metadata journal row without claiming new network I/O.
+        if agent
+            .db
+            .get_sync_journal_entry(operation_id, index_key.as_str())?
+            .is_some()
+        {
+            agent.db.complete_sync_journal_item_reused(
+                operation_id,
+                index_key.as_str(),
+                remote_index.expect("checked index").size,
+            )?;
+        }
+        return Ok((
+            manifest,
+            index,
+            serde_json::json!({
+                "immutable_metadata_reused": true,
+                "cache_read_duration_ms": cache_ms,
+                "visibility_check_duration_ms": elapsed_ms(remote_started),
+                "fetch_duration_ms": 0,
+            }),
+        ));
+    }
+    let manifest = read_committed_manifest(provider, master, app_id, bundle_id).await?;
+    let index = noland_storage::read_pack_index_for_operation(
+        provider,
+        master,
+        app_id,
+        bundle_id,
+        Some(&agent.db),
+        Some(operation_id),
     )
+    .await?;
+    let fetch_ms = elapsed_ms(remote_started);
+    let cache_started = Instant::now();
+    if let Err(error) = cache_parent(agent, &manifest, &index, binding.as_deref(), master) {
+        tracing::warn!(%error, %bundle_id, "authenticated restore metadata cache unavailable");
+    }
+    Ok((
+        manifest,
+        index,
+        serde_json::json!({
+            "immutable_metadata_reused": false,
+            "cache_read_duration_ms": cache_ms,
+            "fetch_duration_ms": fetch_ms,
+            "cache_write_duration_ms": elapsed_ms(cache_started),
+        }),
+    ))
 }
 
 /// Seed a completely restored revision only after its filesystem commit. The
@@ -2566,8 +2766,14 @@ fn mark_noop_completed(
     detail.insert("bundle_id".into(), serde_json::json!(manifest.bundle_id));
     detail.insert("commit_id".into(), serde_json::json!(manifest.commit_id));
     detail.insert("no_op".into(), serde_json::json!(true));
-    agent.db.set_operation_progress(op.operation_id, None)?;
-    persist_operation(agent, op, BackupState::Completed, metrics)
+    crate::operation_diagnostics::retain(agent, op)?;
+    persist_operation(agent, op, BackupState::Committing, metrics)?;
+    crate::operation_diagnostics::prepare_completion(
+        agent,
+        op.operation_id,
+        BackupState::Committing.as_str(),
+        BackupState::Completed.as_str(),
+    )
 }
 
 fn apply_storage_metrics(
@@ -2748,6 +2954,7 @@ pub async fn run_backup_with_session_performance(
     let tuning = transfer_tuning(agent, performance, session);
     let storage =
         RcloneStorage::try_from_session(session, &config_path)?.with_transfer_tuning(tuning);
+    let storage = crate::session_storage::SessionStorage::new(storage, agent, session, master);
     run_backup(
         agent,
         app_id,
@@ -2790,6 +2997,7 @@ pub async fn run_backup_all_with_session_performance(
     let tuning = transfer_tuning(agent, performance, session);
     let storage =
         RcloneStorage::try_from_session(session, &config_path)?.with_transfer_tuning(tuning);
+    let storage = crate::session_storage::SessionStorage::new(storage, agent, session, master);
     run_backup_all(agent, mode, performance, &storage, master, operation_id).await
 }
 
@@ -2917,7 +3125,28 @@ fn transfer_tuning(
     session: &EphemeralRcloneSession,
 ) -> TransferTuning {
     let provider = ProviderKind::parse(&session.provider).unwrap_or(ProviderKind::Local);
-    let workload = if agent.has_latency_sensitive_sessions().unwrap_or(true) {
+    let (baseline_workload, workload) = backup_transfer_workloads(
+        performance,
+        agent.has_latency_sensitive_sessions().unwrap_or(true),
+    );
+    let requested = std::env::var("NOLAND_UPLOAD_WORKERS")
+        .ok()
+        .and_then(|value| value.parse().ok());
+    let tuning = upload_tuning_for_resources(
+        provider,
+        workload,
+        noland_rclone_adapter::WorkerResources::detect(),
+        requested,
+    );
+    log_transfer_tuning(provider, baseline_workload, workload, &tuning);
+    tuning
+}
+
+fn backup_transfer_workloads(
+    performance: BackupPerformanceMode,
+    gameplay: bool,
+) -> (TransferWorkload, TransferWorkload) {
+    let baseline = if gameplay {
         TransferWorkload::GameplaySafe
     } else {
         match performance {
@@ -2927,36 +3156,55 @@ fn transfer_tuning(
             BackupPerformanceMode::Balanced => TransferWorkload::Balanced,
         }
     };
-    let cpus = std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(4);
-    let mut tuning = TransferTuning::for_resources(
-        provider,
-        workload,
-        cpus,
-        Some(TransferTuning::preparation_memory_bytes().unwrap_or(512 * 1024 * 1024) / 2),
-    );
-    // Conservative starting range; optional benchmark overrides only lower it.
-    tuning.max_parallel_uploads = tuning.max_parallel_uploads.min(8);
-    if let Ok(limit) = std::env::var("NOLAND_UPLOAD_WORKERS")
-        .unwrap_or_default()
-        .parse::<usize>()
-    {
+    // This operation-local policy never changes session classification or global
+    // protection. Explicit Balanced remains a user-requested ceiling.
+    let effective = if performance == BackupPerformanceMode::Balanced {
+        TransferWorkload::Balanced
+    } else {
+        baseline.for_active_transfer()
+    };
+    (baseline, effective)
+}
+
+fn upload_tuning_for_resources(
+    provider: ProviderKind,
+    workload: TransferWorkload,
+    resources: noland_rclone_adapter::WorkerResources,
+    requested: Option<usize>,
+) -> TransferTuning {
+    // Keep raw memory and the detected/injected pressure signal together.
+    with_upload_worker_limit(
+        TransferTuning::from_worker_resources(provider, workload.for_active_transfer(), resources),
+        requested,
+    )
+}
+
+fn with_upload_worker_limit(
+    mut tuning: TransferTuning,
+    requested: Option<usize>,
+) -> TransferTuning {
+    // The shared resolver owns resource headroom and provider ceilings. Local
+    // benchmark controls can only lower that admission, never replace it.
+    if let Some(limit) = requested {
         tuning.max_parallel_uploads = limit.clamp(1, tuning.max_parallel_uploads);
     }
     tuning.rclone_transfers = tuning.max_parallel_uploads;
-    log_transfer_tuning(provider, workload, &tuning);
     tuning
 }
 
+#[cfg(test)]
+mod automatic_upload_ceilings;
+
 fn log_transfer_tuning(
     provider: ProviderKind,
+    baseline_workload: TransferWorkload,
     workload: TransferWorkload,
     tuning: &TransferTuning,
 ) {
     tracing::info!(
         provider = provider.as_str(),
-        ?workload,
+        ?baseline_workload,
+        effective_workload = ?workload,
         uploads = tuning.max_parallel_uploads,
         downloads = tuning.max_parallel_downloads,
         rclone_transfers = tuning.rclone_transfers,
@@ -3056,6 +3304,10 @@ mod tests {
         let result = hash_files_parallel(
             jobs,
             4,
+            preparation::Budget {
+                hashing: 4,
+                packing: 1,
+            },
             lease.clone(),
             Default::default(),
             RemoteChunkIndex::empty(),
@@ -3314,7 +3566,7 @@ mod tests {
     #[tokio::test]
     async fn tiny_assets_use_one_regular_pack_while_small_saves_stay_separate() {
         let root = test_root("asset-pack-locality");
-        let agent = StateAgent::boot(AgentConfig::isolated(root.clone())).unwrap();
+        let mut agent = StateAgent::boot(AgentConfig::isolated(root.clone())).unwrap();
         let app = AppId::desktop("asset-pack-locality");
         agent
             .db
@@ -3324,12 +3576,11 @@ mod tests {
         std::fs::create_dir_all(&install).unwrap();
         // >32 MiB of individually small assets formerly needed three compact
         // packs. They now share one normal pack, apart from the compact save.
+        let mut expected_asset_hashes = BTreeSet::new();
         for index in 0..132u8 {
-            std::fs::write(
-                install.join(format!("asset-{index}.bin")),
-                vec![index; 256 * 1024],
-            )
-            .unwrap();
+            let bytes = vec![index; 256 * 1024];
+            assert!(expected_asset_hashes.insert(noland_cas::blake3_hex(&bytes)));
+            std::fs::write(install.join(format!("asset-{index}.bin")), bytes).unwrap();
         }
         agent
             .db
@@ -3338,6 +3589,11 @@ mod tests {
         tracked_save(&agent, &app, "progress.sav", b"save-locality");
         let storage = LocalStorage::new(root.join("cloud"));
         let master = MasterKey::generate();
+        // This checks size/role coalescing, not whether 33 MiB of capture and
+        // durable handoffs beat the production one-second latency flush. Keep
+        // this fixture's partial builders below that age until capture EOF;
+        // byte limits, role separation, real workers and fsyncs stay unchanged.
+        agent.streaming_partial_builder_age = Some(Duration::ZERO);
         let manifest = run_backup(
             &agent,
             &app,
@@ -3355,10 +3611,22 @@ mod tests {
         let by_hash = noland_pack::index_by_hash(&index);
         let mut asset_packs = BTreeSet::new();
         let mut save_packs = BTreeSet::new();
+        let mut asset_hashes = BTreeSet::new();
         for file in &manifest.files {
+            assert_eq!(file.chunks.len(), 1);
+            assert_eq!(file.chunks[0].hash, file.file_hash);
+            assert_eq!(file.chunks[0].size, file.size);
+            assert_eq!(
+                u64::from(by_hash[&file.chunks[0].hash].plaintext_len),
+                file.size
+            );
             let target = if file.semantic_role == SemanticRole::AppContent {
+                assert_eq!(file.size, 256 * 1024);
+                assert!(asset_hashes.insert(file.file_hash.clone()));
                 &mut asset_packs
             } else {
+                assert_eq!(file.file_hash, noland_cas::blake3_hex(b"save-locality"));
+                assert_eq!(file.size, b"save-locality".len() as u64);
                 &mut save_packs
             };
             for chunk in &file.chunks {
@@ -3366,6 +3634,7 @@ mod tests {
             }
         }
         assert_eq!(manifest.files.len(), 133);
+        assert_eq!(asset_hashes, expected_asset_hashes);
         assert_eq!(asset_packs.len(), 1);
         assert_eq!(save_packs.len(), 1);
         assert!(asset_packs.is_disjoint(&save_packs));

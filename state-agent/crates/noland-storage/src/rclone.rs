@@ -4,7 +4,9 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::stream::{self, PeerRates, StreamPolicy, StreamReadFailure, StreamTransferDiagnostics};
+use crate::stream::{
+    self, PeerContext, PeerRates, StreamPolicy, StreamReadFailure, StreamTransferDiagnostics,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use noland_rclone_adapter::{
@@ -16,6 +18,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::OnceCell;
 
+mod fetch;
 pub(crate) mod upload;
 
 use crate::{
@@ -35,6 +38,7 @@ struct StorageCounters {
     remote_download_calls: AtomicU64,
     bytes_uploaded: AtomicU64,
     bytes_downloaded: AtomicU64,
+    metadata_reads: fetch::MetadataReadCounters,
 }
 
 impl StorageCounters {
@@ -63,6 +67,20 @@ impl RcloneFailure {
             "rclone failed ({:?}): {}",
             self.class, self.message
         ))
+    }
+}
+
+struct DownloadAttemptTiming {
+    elapsed: std::time::Duration,
+    observer_wait: std::time::Duration,
+}
+
+impl DownloadAttemptTiming {
+    fn network_sample(&self) -> Option<std::time::Duration> {
+        let network = self.elapsed.saturating_sub(self.observer_wait);
+        // Local journal/progress work is not provider congestion. As with
+        // ordered downloads, discard significantly backpressured samples.
+        (!network.is_zero() && self.observer_wait <= network / 3).then_some(network)
     }
 }
 
@@ -221,7 +239,12 @@ impl RcloneCommandBuilder {
             "--stats-one-line".into(),
             "--use-json-log".into(),
             "--multi-thread-streams".into(),
-            tuning.rclone_download_streams.max(1).to_string(),
+            tuning
+                .rclone_download_streams
+                .max(1)
+                .min(tuning.max_parallel_downloads.max(1))
+                .min(ProviderCapabilities::for_provider(self.provider).max_download_concurrency)
+                .to_string(),
         ];
         self.push_backend_options(&mut args);
         args.extend([source, destination]);
@@ -234,6 +257,32 @@ impl RcloneCommandBuilder {
         let mut args = vec!["cat".into()];
         self.push_backend_options(&mut args);
         args.push(source);
+        args
+    }
+
+    pub fn read_small_args(&self, source_root: String) -> Vec<String> {
+        // Supply exactly one literal key via stdin. Unlike `cat remote:key`,
+        // files-from cannot turn a directory into concatenated descendants, and
+        // directly opens the requested object rather than traversing history.
+        let mut args = vec![
+            "cat".into(),
+            "--files-from-raw".into(),
+            "-".into(),
+            "--no-traverse".into(),
+            "--error-on-no-transfer".into(),
+            "--checkers".into(),
+            "1".into(),
+            "--transfers".into(),
+            "1".into(),
+            "--buffer-size".into(),
+            "0".into(),
+            "--retries".into(),
+            "1".into(),
+            "--low-level-retries".into(),
+            "1".into(),
+        ];
+        self.push_backend_options(&mut args);
+        args.push(source_root);
         args
     }
 
@@ -304,7 +353,6 @@ pub struct RcloneStorage {
     #[cfg(test)]
     upload_executable: Option<PathBuf>,
     download_limiter: Arc<AdaptiveConcurrency>,
-    stream_limiter: Arc<AdaptiveConcurrency>,
     stream_peers: PeerRates,
     stream_policy: StreamPolicy,
     control_timeout: std::time::Duration,
@@ -313,6 +361,8 @@ pub struct RcloneStorage {
     control_executable: Option<PathBuf>,
     #[cfg(test)]
     stream_executable: Option<PathBuf>,
+    #[cfg(test)]
+    progress_executable: Option<PathBuf>,
     root_ready: OnceCell<()>,
     metrics: StorageCounters,
 }
@@ -342,7 +392,6 @@ impl RcloneStorage {
             #[cfg(test)]
             upload_executable: None,
             download_limiter: AdaptiveConcurrency::for_downloads(&tuning),
-            stream_limiter: AdaptiveConcurrency::for_streams(&tuning),
             stream_peers: PeerRates::default(),
             stream_policy: StreamPolicy::default(),
             control_timeout: std::time::Duration::from_secs(120),
@@ -351,6 +400,8 @@ impl RcloneStorage {
             control_executable: None,
             #[cfg(test)]
             stream_executable: None,
+            #[cfg(test)]
+            progress_executable: None,
             tuning,
             root_ready: OnceCell::new(),
             metrics: StorageCounters::default(),
@@ -400,7 +451,6 @@ impl RcloneStorage {
             #[cfg(test)]
             upload_executable: None,
             download_limiter: AdaptiveConcurrency::for_downloads(&tuning),
-            stream_limiter: AdaptiveConcurrency::for_streams(&tuning),
             stream_peers: PeerRates::default(),
             stream_policy: StreamPolicy::default(),
             control_timeout: std::time::Duration::from_secs(120),
@@ -409,6 +459,8 @@ impl RcloneStorage {
             control_executable: None,
             #[cfg(test)]
             stream_executable: None,
+            #[cfg(test)]
+            progress_executable: None,
             tuning,
             root_ready: OnceCell::new(),
             metrics: StorageCounters::default(),
@@ -421,11 +473,18 @@ impl RcloneStorage {
             .max_parallel_uploads
             .min(self.capabilities.max_upload_concurrency)
             .clamp(1, 32);
+        tuning.max_parallel_downloads = tuning
+            .max_parallel_downloads
+            .min(self.capabilities.max_download_concurrency)
+            .clamp(1, 32);
+        tuning.rclone_download_streams = tuning
+            .rclone_download_streams
+            .min(tuning.max_parallel_downloads)
+            .max(1);
         self.retry_gate = Arc::new(SharedRetryGate::new(tuning.clone()));
         self.upload_limiter = AdaptiveConcurrency::for_uploads(&tuning);
         self.upload_peers = PeerRates::default();
         self.download_limiter = AdaptiveConcurrency::for_downloads(&tuning);
-        self.stream_limiter = AdaptiveConcurrency::for_streams(&tuning);
         self.stream_peers = PeerRates::default();
         self.tuning = tuning;
         self
@@ -504,7 +563,6 @@ impl RcloneStorage {
     fn record_remote_error(&self, class: RemoteErrorClass) {
         self.upload_limiter.record_error(class);
         self.download_limiter.record_error(class);
-        self.stream_limiter.record_error(class);
     }
 
     async fn run(&self, args: Vec<String>) -> Result<String> {
@@ -549,7 +607,11 @@ impl RcloneStorage {
         #[cfg(test)]
         if _control {
             if let Some(executable) = &self.control_executable {
-                return Command::new(executable);
+                // Avoid macOS validation of a freshly written executable script;
+                // fixture deadlines must exercise the command, not its launch.
+                let mut command = Command::new("/bin/sh");
+                command.arg(executable);
+                return command;
             }
         }
         Command::new("rclone")
@@ -645,6 +707,7 @@ impl RcloneStorage {
 
     async fn stat_inner(&self, key: &RemoteKey, control: bool) -> Result<Option<RemoteMeta>> {
         validate_remote_key(key)?;
+        let _permit = self.download_limiter.acquire().await?;
         self.metrics
             .remote_stat_calls
             .fetch_add(1, Ordering::Relaxed);
@@ -686,7 +749,7 @@ impl RcloneStorage {
         &self,
         args: Vec<String>,
         mut on_progress: impl FnMut(u64) -> Result<()>,
-    ) -> Result<std::time::Duration> {
+    ) -> Result<DownloadAttemptTiming> {
         forbid_rclone_sync(&args)?;
         if let Some(arg) =
             self.extra_args.iter().chain(args.iter()).find(|arg| {
@@ -703,10 +766,16 @@ impl RcloneStorage {
         for attempt in 1..=max_attempts {
             self.retry_gate.wait_for_turn().await;
             let started = std::time::Instant::now();
+            let mut observer_wait = std::time::Duration::ZERO;
             self.metrics
                 .rclone_invocations
                 .fetch_add(1, Ordering::Relaxed);
             let mut cmd = Command::new("rclone");
+            #[cfg(test)]
+            if let Some(executable) = &self.progress_executable {
+                cmd = Command::new("/bin/sh");
+                cmd.arg(executable);
+            }
             cmd.args(&self.extra_args)
                 .args(&args)
                 .stdout(Stdio::null())
@@ -732,9 +801,27 @@ impl RcloneStorage {
             })?;
             let mut lines = BufReader::new(stderr).lines();
             let mut error_output = String::new();
-            while let Some(line) = lines.next_line().await? {
+            let mut pressure_tick = tokio::time::interval(
+                self.stream_policy
+                    .observation_interval
+                    .max(std::time::Duration::from_millis(1)),
+            );
+            pressure_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                let line = tokio::select! {
+                    line = lines.next_line() => line?,
+                    _ = pressure_tick.tick() => {
+                        self.download_limiter
+                            .observe_local_pressure((self.stream_policy.io_pressure)());
+                        continue;
+                    }
+                };
+                let Some(line) = line else { break };
                 if let Some(bytes) = parse_rclone_stats_bytes(&line) {
-                    if let Err(error) = on_progress(bytes) {
+                    let local = std::time::Instant::now();
+                    let observed = on_progress(bytes);
+                    observer_wait = observer_wait.saturating_add(local.elapsed());
+                    if let Err(error) = observed {
                         let _ = child.kill().await;
                         return Err(error);
                     }
@@ -754,7 +841,10 @@ impl RcloneStorage {
             }
             let status = child.wait().await?;
             if status.success() {
-                return Ok(started.elapsed());
+                return Ok(DownloadAttemptTiming {
+                    elapsed: started.elapsed(),
+                    observer_wait,
+                });
             }
             let failure = RcloneFailure {
                 class: classify_remote_error(status.code(), error_output.trim()),
@@ -805,7 +895,11 @@ impl RcloneStorage {
                     Ok(())
                 },
                 limiter_wait,
-                upload::UploadPolicy::default(),
+                upload::UploadPolicy {
+                    io_pressure: self.stream_policy.io_pressure,
+                    transfer_slots: current_tuning.rclone_transfers,
+                    ..upload::UploadPolicy::default()
+                },
             )
             .await;
         drop(permit);
@@ -1185,35 +1279,55 @@ impl SharedStorageProvider for RcloneStorage {
         self.download_observed(key, dest, None).await
     }
 
+    async fn read_small(&self, key: &RemoteKey, limit: u64) -> Result<Vec<u8>> {
+        self.read_small_bounded(key, limit).await
+    }
+
     async fn download_observed(
         &self,
         key: &RemoteKey,
         dest: &Path,
         observer: Option<&(dyn DownloadObserver + '_)>,
     ) -> Result<()> {
-        let permit = self.download_limiter.acquire().await?;
+        self.download_limiter
+            .observe_local_pressure((self.stream_policy.io_pressure)());
+        let permit = self
+            .download_limiter
+            .acquire_slots(self.tuning.rclone_download_streams)
+            .await?;
         self.metrics
             .remote_download_calls
             .fetch_add(1, Ordering::Relaxed);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let mut current_tuning = self.tuning.clone();
+        current_tuning.rclone_download_streams = permit.slots();
         let args = self.command_builder.download_copyto_args(
-            &self.tuning,
+            &current_tuning,
             self.remote_path(key),
             dest.display().to_string(),
         );
-        let result = match observer {
-            Some(observer) => {
-                observer.transfer_started()?;
-                self.run_with_progress(args, |bytes| observer.transfer_progress(bytes))
-                    .await
-            }
-            None => self.run_timed(args).await.map(|(_, elapsed)| elapsed),
-        };
-        if let Ok(elapsed) = &result {
+        if let Some(observer) = observer {
+            observer.transfer_started()?;
+        }
+        // Even callers without a UI observer need bounded, periodic pressure
+        // observations so a temporary local cap can clear before file EOF.
+        let result = self
+            .run_with_progress(args, |bytes| {
+                observer.map_or(Ok(()), |observer| observer.transfer_progress(bytes))
+            })
+            .await;
+        if let Ok(timing) = &result {
             let bytes = std::fs::metadata(dest).map(|meta| meta.len()).unwrap_or(0);
-            self.download_limiter.record_success(bytes, *elapsed);
+            let pressured = (self.stream_policy.io_pressure)();
+            self.download_limiter.observe_local_pressure(pressured);
+            if !pressured {
+                if let Some(network) = timing.network_sample() {
+                    self.download_limiter
+                        .record_success(bytes / permit.slots() as u64, network);
+                }
+            }
         }
         drop(permit);
         result?;
@@ -1238,8 +1352,15 @@ impl SharedStorageProvider for RcloneStorage {
     ) -> Result<()> {
         validate_remote_key(key)?;
         let waiting = std::time::Instant::now();
-        let _permit = self.stream_limiter.acquire().await?;
+        self.download_limiter
+            .observe_local_pressure((self.stream_policy.io_pressure)());
+        let _permit = self.download_limiter.acquire().await?;
         let mut diagnostics = StreamTransferDiagnostics {
+            worker_ceiling: self.download_limiter.max(),
+            effective_worker_limit: self.download_limiter.current(),
+            reserved_transfer_slots: self.download_limiter.active(),
+            queued_transfer_requests: self.download_limiter.queued(),
+            controller_epoch: self.download_limiter.epoch(),
             limiter_wait_us: stream::micros(waiting.elapsed()),
             ..StreamTransferDiagnostics::default()
         };
@@ -1268,6 +1389,10 @@ impl SharedStorageProvider for RcloneStorage {
             diagnostics.attempt = attempt;
             diagnostics.attempt_bytes = 0;
             diagnostics.phase = "receiving".into();
+            diagnostics.effective_worker_limit = self.download_limiter.current();
+            diagnostics.reserved_transfer_slots = self.download_limiter.active();
+            diagnostics.queued_transfer_requests = self.download_limiter.queued();
+            diagnostics.controller_epoch = self.download_limiter.epoch();
             let processing = std::time::Instant::now();
             consumer.restart().await?;
             diagnostics.consumer_us = diagnostics
@@ -1310,6 +1435,39 @@ impl SharedStorageProvider for RcloneStorage {
             let before_consumer = diagnostics.consumer_us;
             let allow_slow_restart =
                 diagnostics.slow_restarts == 0 && attempt < self.tuning.max_attempts.max(1);
+            let starting_pressure = (self.stream_policy.io_pressure)();
+            self.download_limiter
+                .observe_local_pressure(starting_pressure);
+            let initial_context = PeerContext::new(
+                self.download_limiter.active(),
+                1,
+                self.download_limiter.epoch(),
+            );
+            let sample_stable = std::sync::atomic::AtomicBool::new(!starting_pressure);
+            let stable = &sample_stable;
+            let pressure_cache =
+                std::cell::Cell::new((std::time::Instant::now(), starting_pressure));
+            let observation_interval = self
+                .stream_policy
+                .observation_interval
+                .max(std::time::Duration::from_millis(1));
+            let observe_context = move || {
+                let (observed, mut pressured) = pressure_cache.get();
+                if observed.elapsed() >= observation_interval {
+                    pressured = (self.stream_policy.io_pressure)();
+                    pressure_cache.set((std::time::Instant::now(), pressured));
+                    self.download_limiter.observe_local_pressure(pressured);
+                }
+                let context = PeerContext::new(
+                    self.download_limiter.active(),
+                    1,
+                    self.download_limiter.epoch(),
+                );
+                if pressured || context != initial_context {
+                    stable.store(false, Ordering::Relaxed);
+                }
+                context
+            };
             let (done, ended) = tokio::sync::oneshot::channel();
             // No detached tasks. An unsuccessful read kills the child before
             // draining stderr; successful EOF bounds only exit housekeeping.
@@ -1323,6 +1481,7 @@ impl SharedStorageProvider for RcloneStorage {
                     self.stream_policy,
                     allow_slow_restart,
                     &self.metrics.bytes_downloaded,
+                    observe_context,
                 )
                 .await;
                 if result.is_err() {
@@ -1397,10 +1556,29 @@ impl SharedStorageProvider for RcloneStorage {
                                 return Err(error);
                             }
                             // Disk/decoder backpressure is not provider congestion.
-                            if consumed <= receive / 3 {
-                                self.stream_limiter.record_success(bytes, receive);
-                                self.stream_peers.record(bytes, receive, consumed);
+                            let pressured = (self.stream_policy.io_pressure)();
+                            self.download_limiter.observe_local_pressure(pressured);
+                            if !pressured && consumed <= receive / 3 {
+                                self.download_limiter.record_success(bytes, receive);
+                                if sample_stable.load(Ordering::Relaxed)
+                                    && PeerContext::new(
+                                        self.download_limiter.active(),
+                                        1,
+                                        self.download_limiter.epoch(),
+                                    ) == initial_context
+                                {
+                                    self.stream_peers.record_with_context(
+                                        bytes,
+                                        receive,
+                                        consumed,
+                                        initial_context,
+                                    );
+                                }
                             }
+                            diagnostics.effective_worker_limit = self.download_limiter.current();
+                            diagnostics.reserved_transfer_slots = self.download_limiter.active();
+                            diagnostics.queued_transfer_requests = self.download_limiter.queued();
+                            diagnostics.controller_epoch = self.download_limiter.epoch();
                             diagnostics.phase = "completed".into();
                             stream::observe(observer, &diagnostics)?;
                             return Ok(());
@@ -1461,6 +1639,7 @@ impl SharedStorageProvider for RcloneStorage {
 
     async fn list_prefix(&self, prefix: &RemoteKey) -> Result<Vec<RemoteEntry>> {
         validate_remote_key(prefix)?;
+        let _permit = self.download_limiter.acquire().await?;
         self.metrics
             .remote_list_calls
             .fetch_add(1, Ordering::Relaxed);
@@ -1546,16 +1725,19 @@ impl SharedStorageProvider for RcloneStorage {
     fn operation_metrics(&self) -> StorageOperationMetrics {
         self.metrics.snapshot()
     }
+
+    fn metadata_read_metrics(&self) -> crate::MetadataReadMetrics {
+        self.metrics.metadata_reads.snapshot()
+    }
 }
 
 pub struct EphemeralSessionGuard {
-    run_root: PathBuf,
-    operation_id: String,
+    directory: PathBuf,
 }
 
 impl Drop for EphemeralSessionGuard {
     fn drop(&mut self) {
-        let _ = shred_ephemeral_session(&self.run_root, &self.operation_id);
+        let _ = shred_owned_session_dir(&self.directory);
     }
 }
 
@@ -1563,42 +1745,162 @@ pub fn write_guarded_ephemeral_session(
     run_root: &Path,
     session: &EphemeralRcloneSession,
 ) -> Result<(PathBuf, EphemeralSessionGuard)> {
-    let config_path = write_ephemeral_session(run_root, session)?;
-    Ok((
-        config_path,
-        EphemeralSessionGuard {
-            run_root: run_root.to_path_buf(),
-            operation_id: session.operation_id.clone(),
-        },
-    ))
+    validate_session_component(&session.operation_id)?;
+    std::fs::create_dir_all(run_root)?;
+    // The caller supplies a trusted root. Resolve macOS's /var -> /private
+    // alias before no-follow file opens, not any untrusted session component.
+    let run_root = std::fs::canonicalize(run_root)?;
+    // A logical session can be reused by nested callers or separate processes
+    // before repository admission. Never share its credential-file lifetime.
+    let execution_id = uuid::Uuid::new_v4().to_string();
+    let directory = create_private_session_dir(&run_root, &execution_id)?;
+    let guard = EphemeralSessionGuard {
+        directory: directory.clone(),
+    };
+    // Construct the guard before the first credential write, so partial writes
+    // are shredded on every error too. session.json retains the logical ID.
+    let config_path = write_session_files(&directory, session)?;
+    Ok((config_path, guard))
 }
 
 pub fn write_ephemeral_session(
     run_root: &Path,
     session: &EphemeralRcloneSession,
 ) -> Result<PathBuf> {
+    validate_session_component(&session.operation_id)?;
+    std::fs::create_dir_all(run_root)?;
+    let run_root = std::fs::canonicalize(run_root)?;
+    ensure_storage_root(&run_root)?;
+    // Retain the raw API's logical path for legacy callers.
     let dir = run_root.join("storage").join(&session.operation_id);
     std::fs::create_dir_all(&dir)?;
+    require_real_directory(&dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     }
-    let config_path = dir.join("rclone.conf");
-    std::fs::write(&config_path, session.config_ini.as_bytes())?;
-    let session_path = dir.join("session.json");
-    std::fs::write(&session_path, serde_json::to_vec(session)?)?;
+    let result = write_session_files(&dir, session);
+    if result.is_err() {
+        let _ = shred_owned_session_dir(&dir);
+    }
+    result
+}
+
+fn validate_session_component(id: &str) -> Result<()> {
+    if id.is_empty()
+        || id.len() > 255
+        || matches!(id, "." | "..")
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(StateError::Invalid(
+            "invalid ephemeral session identity".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_real_directory(directory: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(directory)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(StateError::UnsafePath(
+            "ephemeral session directory is not a private directory".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_storage_root(run_root: &Path) -> Result<()> {
+    let storage_root = run_root.join("storage");
+    match std::fs::create_dir(&storage_root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    require_real_directory(&storage_root)
+}
+
+fn create_private_session_dir(run_root: &Path, execution_id: &str) -> Result<PathBuf> {
+    ensure_storage_root(run_root)?;
+    let directory = run_root.join("storage").join(execution_id);
+    let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600));
-        let _ = std::fs::set_permissions(&session_path, std::fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
     }
+    // create_dir, not create_dir_all: a UUID collision must never overwrite an
+    // execution's credentials, even across processes.
+    builder.create(&directory)?;
+    Ok(directory)
+}
+
+fn write_session_files(dir: &Path, session: &EphemeralRcloneSession) -> Result<PathBuf> {
+    let config_path = dir.join("rclone.conf");
+    let write_private = |path: &Path, contents: &[u8]| -> Result<()> {
+        use std::io::Write;
+        #[cfg(unix)]
+        let mut file = noland_snapshot::SourcePath::new(path)?.open_or_create_private()?;
+        #[cfg(not(unix))]
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        file.set_len(0)?;
+        file.write_all(contents)?;
+        Ok(())
+    };
+    write_private(&config_path, session.config_ini.as_bytes())?;
+    let session_path = dir.join("session.json");
+    write_private(&session_path, &serde_json::to_vec(session)?)?;
     Ok(config_path)
 }
 
 pub fn shred_ephemeral_session(run_root: &Path, operation_id: &str) -> Result<()> {
-    crate::shred_ephemeral_auth(run_root, operation_id)
+    validate_session_component(operation_id)?;
+    if !run_root.exists() {
+        return Ok(());
+    }
+    let run_root = std::fs::canonicalize(run_root)?;
+    let storage_root = run_root.join("storage");
+    if !storage_root.exists() {
+        return Ok(());
+    }
+    require_real_directory(&storage_root)?;
+    shred_owned_session_dir(&storage_root.join(operation_id))
+}
+
+fn shred_owned_session_dir(directory: &Path) -> Result<()> {
+    if !directory.exists() {
+        return Ok(());
+    }
+    require_real_directory(directory)?;
+    for filename in ["auth.json", "rclone.conf", "session.json"] {
+        let path = directory.join(filename);
+        if std::fs::symlink_metadata(&path)
+            .is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink())
+        {
+            use std::io::Write;
+            #[cfg(unix)]
+            let file = noland_snapshot::SourcePath::new(&path)?.open_or_create_private();
+            #[cfg(not(unix))]
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .map_err(StateError::from);
+            if let Ok(mut file) = file {
+                let len = file.metadata()?.len().min(1024 * 1024) as usize;
+                let _ = file.write_all(&vec![0; len]);
+            }
+        }
+    }
+    // remove_dir_all does not follow symlink leaves. Never canonicalize a
+    // credential filename and accidentally overwrite data outside our directory.
+    std::fs::remove_dir_all(directory)?;
+    Ok(())
 }
 
 pub fn shred_all_ephemeral_sessions(run_root: &Path) -> Result<()> {
@@ -1644,6 +1946,56 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn metadata_batch_never_publishes_committed_until_all_ordinary_entries_succeed() {
+        for fail_ordinary in [false, true] {
+            let root = std::env::temp_dir()
+                .join(format!("noland-metadata-order-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let script = root.join("fixture");
+            let events = root.join("events");
+            let completed = root.join("ordinary-done");
+            let fail = root.join("fail");
+            if fail_ordinary {
+                std::fs::write(&fail, b"").unwrap();
+            }
+            std::fs::write(&script, format!(
+                "set -eu\nstage=''\nfor arg in \"$@\"; do if [ -d \"$arg\" ]; then stage=\"$arg\"; fi; done\n[ -n \"$stage\" ]\nif [ -f \"$stage/metadata/COMMITTED\" ]; then\n [ -f {completed:?} ]\n [ ! -f \"$stage/metadata/index.enc\" ]\n [ ! -f \"$stage/metadata/manifest.enc\" ]\n [ ! -f \"$stage/metadata/manifest.hash\" ]\n printf 'committed\\n' >> {events:?}\nelse\n [ -f \"$stage/metadata/index.enc\" ]\n [ -f \"$stage/metadata/manifest.enc\" ]\n [ -f \"$stage/metadata/manifest.hash\" ]\n printf 'ordinary:start\\n' >> {events:?}\n if [ -f {fail:?} ]; then exit 7; fi\n : > {completed:?}\n printf 'ordinary:done\\n' >> {events:?}\nfi\n"
+            )).unwrap();
+            let mut storage = RcloneStorage::new("fixture", "approved-root");
+            storage.upload_executable = Some(script);
+            let batch = MetadataBatch::with_committed(
+                ["index.enc", "manifest.enc", "manifest.hash"]
+                    .into_iter()
+                    .map(|name| {
+                        MetadataWrite::new(
+                            RemoteKey::new(format!("metadata/{name}")),
+                            Bytes::from_static(b"sealed"),
+                        )
+                    })
+                    .collect(),
+                MetadataWrite::new(
+                    RemoteKey::new("metadata/COMMITTED"),
+                    Bytes::from_static(b"commit-id"),
+                ),
+            );
+            let result = storage.put_metadata_batch(&batch).await;
+            let observed = std::fs::read_to_string(&events).unwrap();
+            if fail_ordinary {
+                assert!(result.is_err());
+                assert_eq!(observed, "ordinary:start\n");
+                assert_eq!(storage.operation_metrics().rclone_invocations, 1);
+            } else {
+                assert_eq!(result.unwrap().len(), 4);
+                assert_eq!(observed, "ordinary:start\nordinary:done\ncommitted\n");
+                assert_eq!(storage.operation_metrics().rclone_invocations, 2);
+            }
+            assert_eq!(storage.upload_limiter.active(), 0);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn deletion_control_timeout_reaps_the_child_without_an_overlapping_retry() {
         use std::os::unix::fs::PermissionsExt;
         let root =
@@ -1659,9 +2011,9 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut storage = RcloneStorage::new("fixture", "").for_deletion();
         storage.control_executable = Some(script);
-        // macOS may validate a cold script before it starts. Leave the same
-        // startup allowance as the stream fixtures; the intentional 30s sleep
-        // must be what exercises the timeout, not interpreter startup latency.
+        // Invoke fixtures through the system shell and leave a generous startup
+        // allowance. The intentional 30s sleep, not script validation, must be
+        // what exercises this bounded deadline.
         storage.control_timeout = std::time::Duration::from_secs(2);
         let result = storage
             .stat_for_deletion(&RemoteKey::new("packs/fixture"))
@@ -1751,6 +2103,7 @@ mod tests {
             storage.stream_policy = StreamPolicy {
                 idle_timeout: std::time::Duration::from_secs(2),
                 exit_timeout: std::time::Duration::from_millis(500),
+                io_pressure: || false,
                 ..StreamPolicy::default()
             };
             Self { root, storage }
@@ -1801,6 +2154,243 @@ mod tests {
             self.0.lock().unwrap().push(metrics.clone());
             Ok(())
         }
+    }
+
+    #[test]
+    fn copyto_feedback_subtracts_small_observer_waits_and_rejects_local_backpressure() {
+        use std::time::Duration;
+        assert_eq!(
+            DownloadAttemptTiming {
+                elapsed: Duration::from_millis(100),
+                observer_wait: Duration::from_millis(10),
+            }
+            .network_sample(),
+            Some(Duration::from_millis(90))
+        );
+        for (elapsed, observer) in [(100, 80), (100, 100), (100, 101), (0, 0)] {
+            assert!(DownloadAttemptTiming {
+                elapsed: Duration::from_millis(elapsed),
+                observer_wait: Duration::from_millis(observer),
+            }
+            .network_sample()
+            .is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn slow_copyto_observers_do_not_reduce_the_shared_network_limit() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        struct SlowObserver(AtomicU64);
+        impl DownloadObserver for SlowObserver {
+            fn transfer_progress(&self, _bytes: u64) -> Result<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(100));
+                Ok(())
+            }
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("noland-copyto-observer-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("copyto-fixture");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nset -eu\nfor destination in \"$@\"; do :; done\nprintf payload > \"$destination\"\nprintf '%s\\n' '{\"stats\":{\"bytes\":7}}' >&2\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut storage =
+            RcloneStorage::new("fixture", "root").with_transfer_tuning(TransferTuning {
+                max_parallel_downloads: 4,
+                rclone_download_streams: 2,
+                ..Default::default()
+            });
+        storage.progress_executable = Some(script);
+        storage.stream_policy.io_pressure = || false;
+        storage
+            .download_limiter
+            .record_success(1024 * 1024, Duration::from_millis(1));
+        storage
+            .download_limiter
+            .record_error(RemoteErrorClass::RateLimited);
+        assert_eq!(storage.download_limiter.current(), 2);
+        let observer = SlowObserver(AtomicU64::new(0));
+        for index in 0..4 {
+            let destination = root.join(format!("download/{index}"));
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                storage.download_observed(
+                    &RemoteKey::new(format!("packs/{index}")),
+                    &destination,
+                    Some(&observer),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(std::fs::read(destination).unwrap(), b"payload");
+        }
+        assert_eq!(observer.0.load(Ordering::SeqCst), 4);
+        assert_eq!(storage.download_limiter.current(), 2);
+        assert_eq!(storage.download_limiter.active(), 0);
+        assert_eq!(storage.operation_metrics().bytes_downloaded, 28);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unobserved_copyto_keeps_sampling_pressure_without_reducing_the_limit_to_one() {
+        static SAMPLES: AtomicU64 = AtomicU64::new(0);
+        fn pressure() -> bool {
+            SAMPLES.fetch_add(1, Ordering::SeqCst) < 2
+        }
+        let mut fixture = StreamFixture::new(
+            "for destination in \"$@\"; do :; done\nprintf payload > \"$destination\"\necho '{\"stats\":{\"bytes\":3}}' >&2\nsleep 0.08\necho '{\"stats\":{\"bytes\":7}}' >&2\nexit 0",
+        );
+        fixture.storage.progress_executable = fixture.storage.stream_executable.clone();
+        fixture.storage.stream_policy.io_pressure = pressure;
+        fixture.storage.stream_policy.observation_interval = std::time::Duration::from_millis(10);
+        let destination = fixture.root.join("copyto-result");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fixture
+                .storage
+                .download_observed(&RemoteKey::new("packs/fixture"), &destination, None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(std::fs::read(destination).unwrap(), b"payload");
+        assert!(SAMPLES.load(Ordering::SeqCst) >= 3);
+        assert_eq!(fixture.storage.download_limiter.current(), 2);
+        assert_eq!(fixture.storage.download_limiter.active(), 0);
+        assert_eq!(fixture.storage.operation_metrics().rclone_invocations, 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unobserved_pack_stream_keeps_sampling_pressure_while_waiting_for_bytes() {
+        static SAMPLES: AtomicU64 = AtomicU64::new(0);
+        fn pressure() -> bool {
+            SAMPLES.fetch_add(1, Ordering::SeqCst) < 2
+        }
+        let mut fixture = StreamFixture::new("printf abc\nsleep 0.08\nprintf def\nexit 0");
+        fixture.storage.stream_policy.io_pressure = pressure;
+        fixture.storage.stream_policy.observation_interval = std::time::Duration::from_millis(10);
+        let consumer = StreamBuffer::default();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fixture.storage.download_stream_observed(
+                &RemoteKey::new("packs/fixture"),
+                &fixture.root.join("unused"),
+                &consumer,
+                None,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&*consumer.bytes.lock().unwrap(), b"abcdef");
+        assert!(SAMPLES.load(Ordering::SeqCst) >= 3);
+        assert_eq!(fixture.storage.download_limiter.current(), 2);
+        assert_eq!(fixture.storage.download_limiter.active(), 0);
+        assert_eq!(fixture.storage.operation_metrics().rclone_invocations, 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn actual_download_rate_limit_still_reduces_network_admission() {
+        let mut fixture = StreamFixture::new("echo '429 rate limit exceeded' >&2\nexit 5");
+        fixture.storage.progress_executable = fixture.storage.stream_executable.clone();
+        fixture.storage.tuning.max_attempts = 1;
+        let error = fixture
+            .storage
+            .download_observed(
+                &RemoteKey::new("packs/fixture"),
+                &fixture.root.join("missing"),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("RateLimited"));
+        assert_eq!(fixture.storage.download_limiter.current(), 2);
+        assert_eq!(fixture.storage.download_limiter.active(), 0);
+        assert_eq!(fixture.storage.operation_metrics().rclone_invocations, 1);
+    }
+
+    #[test]
+    fn automatic_or_legacy_tuning_cannot_exceed_provider_limits_in_either_direction() {
+        for provider in [
+            ProviderKind::GoogleDrive,
+            ProviderKind::MicrosoftOneDrive,
+            ProviderKind::AmazonS3,
+            ProviderKind::Sftp,
+        ] {
+            let capabilities = ProviderCapabilities::for_provider(provider);
+            let mut storage = RcloneStorage::new("fixture", "root");
+            storage.provider_kind = provider;
+            storage.capabilities = capabilities.clone();
+            storage.command_builder = RcloneCommandBuilder::new(
+                provider,
+                provider.backend_type(),
+                TransferProfile::for_provider(provider, provider.backend_type()).unwrap(),
+            )
+            .unwrap();
+            let storage = storage.with_transfer_tuning(TransferTuning {
+                max_parallel_uploads: usize::MAX,
+                max_parallel_downloads: usize::MAX,
+                rclone_download_streams: usize::MAX,
+                ..Default::default()
+            });
+            assert_eq!(
+                storage.tuning.max_parallel_uploads,
+                capabilities.max_upload_concurrency
+            );
+            assert_eq!(
+                storage.download_limiter.max(),
+                capabilities.max_download_concurrency
+            );
+            assert_eq!(
+                storage.tuning.rclone_download_streams,
+                capabilities.max_download_concurrency
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ordered_download_and_copyto_reservations_share_one_provider_ceiling() {
+        let fixture = StreamFixture::new("printf abcdef; exit 0");
+        let copyto = fixture
+            .storage
+            .download_limiter
+            .acquire_slots(3)
+            .await
+            .unwrap();
+        let target = StreamBuffer::default();
+        let observer = StreamObserver::default();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fixture.storage.download_stream_observed(
+                &RemoteKey::new("packs/test"),
+                &fixture.root.join("unused"),
+                &target,
+                Some(&observer),
+            ),
+        )
+        .await
+        .expect("the ordered stream must use the single remaining connection slot")
+        .unwrap();
+        assert_eq!(&*target.bytes.lock().unwrap(), b"abcdef");
+        let first = observer.0.lock().unwrap().first().unwrap().clone();
+        assert_eq!(first.worker_ceiling, 4);
+        assert_eq!(first.reserved_transfer_slots, 4);
+        assert_eq!(fixture.storage.download_limiter.active(), 3);
+        drop(copyto);
+        assert_eq!(fixture.storage.download_limiter.active(), 0);
     }
 
     #[cfg(unix)]
@@ -1994,16 +2584,178 @@ mod tests {
             prefix: Some("Noland Shared Storage".into()),
         };
         let session = session_from_input(&input, "op-guard", TokenMode::Ephemeral).unwrap();
-        let session_dir = run_root.join("storage/op-guard");
-
-        {
-            let (config, _guard) = write_guarded_ephemeral_session(&run_root, &session).unwrap();
-            assert!(config.is_file());
-            assert!(session_dir.is_dir());
-        }
+        let (config, guard) = write_guarded_ephemeral_session(&run_root, &session).unwrap();
+        let session_dir = config.parent().unwrap().to_path_buf();
+        assert!(config.is_file());
+        assert!(session_dir.is_dir());
+        assert_ne!(session_dir, run_root.join("storage/op-guard"));
+        let saved: EphemeralRcloneSession =
+            serde_json::from_slice(&std::fs::read(session_dir.join("session.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved.operation_id, "op-guard");
+        drop(guard);
 
         assert!(!session_dir.exists());
         let _ = std::fs::remove_dir_all(run_root);
+    }
+
+    #[test]
+    fn guarded_sessions_with_the_same_logical_id_own_distinct_credentials() {
+        let run_root =
+            std::env::temp_dir().join(format!("noland-session-{}", uuid::Uuid::new_v4()));
+        let mut session = EphemeralRcloneSession {
+            operation_id: "same-logical-session".into(),
+            provider: "local".into(),
+            backend_type: "local".into(),
+            remote_name: "fixture".into(),
+            root: "/local-only".into(),
+            config_ini: "[fixture]\ntype = local\n# first private config\n".into(),
+            expires_at_unix: 0,
+            upload_concurrency: None,
+        };
+        for drop_first in [true, false] {
+            let (first_path, first) = write_guarded_ephemeral_session(&run_root, &session).unwrap();
+            session.config_ini = "[fixture]\ntype = local\n# second private config\n".into();
+            let (second_path, second) =
+                write_guarded_ephemeral_session(&run_root, &session).unwrap();
+            assert_ne!(first_path, second_path);
+            assert!(std::fs::read_to_string(&first_path)
+                .unwrap()
+                .contains("first private"));
+            assert!(std::fs::read_to_string(&second_path)
+                .unwrap()
+                .contains("second private"));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&first_path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+                assert_eq!(
+                    std::fs::metadata(first_path.parent().unwrap())
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o700
+                );
+            }
+            if drop_first {
+                drop(first);
+                assert!(!first_path.parent().unwrap().exists());
+                assert!(second_path.is_file());
+                drop(second);
+            } else {
+                drop(second);
+                assert!(!second_path.parent().unwrap().exists());
+                assert!(first_path.is_file());
+                drop(first);
+            }
+            assert!(!first_path.parent().unwrap().exists());
+            assert!(!second_path.parent().unwrap().exists());
+            session.config_ini = "[fixture]\ntype = local\n# first private config\n".into();
+        }
+        std::fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    fn ephemeral_session_id_cannot_escape_its_storage_root() {
+        let root =
+            std::env::temp_dir().join(format!("noland-session-path-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let sentinel = root.join("sentinel");
+        std::fs::write(&sentinel, b"keep").unwrap();
+        let mut session = EphemeralRcloneSession {
+            operation_id: String::new(),
+            provider: "local".into(),
+            backend_type: "local".into(),
+            remote_name: "fixture".into(),
+            root: "/local-only".into(),
+            config_ini: "[fixture]\ntype = local\n".into(),
+            expires_at_unix: 0,
+            upload_concurrency: None,
+        };
+        for id in [
+            "",
+            ".",
+            "..",
+            "../sentinel",
+            "/absolute",
+            "a/b",
+            "a\\b",
+            "C:\\escape",
+            "bad\0id",
+            "bad\nid",
+            "bad\rid",
+        ] {
+            session.operation_id = id.into();
+            assert!(write_ephemeral_session(&root, &session).is_err());
+            assert!(write_guarded_ephemeral_session(&root, &session).is_err());
+            assert!(shred_ephemeral_session(&root, id).is_err());
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
+            assert!(!root.join("storage").exists());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forged_session_symlinks_never_write_or_shred_external_files() {
+        use std::os::unix::fs::symlink;
+        let root =
+            std::env::temp_dir().join(format!("noland-session-links-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("storage")).unwrap();
+        std::fs::create_dir_all(root.join("outside")).unwrap();
+        let outside = root.join("outside/rclone.conf");
+        std::fs::write(&outside, b"keep").unwrap();
+        symlink(root.join("outside"), root.join("storage/forged")).unwrap();
+        let mut session = EphemeralRcloneSession {
+            operation_id: "forged".into(),
+            provider: "local".into(),
+            backend_type: "local".into(),
+            remote_name: "fixture".into(),
+            root: "/local-only".into(),
+            config_ini: "[fixture]\ntype = local\n".into(),
+            expires_at_unix: 0,
+            upload_concurrency: None,
+        };
+        assert!(write_ephemeral_session(&root, &session).is_err());
+        assert!(shred_ephemeral_session(&root, "forged").is_err());
+        session.operation_id = "fixture".into();
+        let (config, guard) = write_guarded_ephemeral_session(&root, &session).unwrap();
+        std::fs::remove_file(&config).unwrap();
+        symlink(&outside, &config).unwrap();
+        drop(guard);
+        assert!(!config.parent().unwrap().exists());
+        assert_eq!(std::fs::read(outside).unwrap(), b"keep");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn guarded_session_accepts_trusted_var_alias_and_cleans_owned_canonical_directory() {
+        let root =
+            std::env::temp_dir().join(format!("noland-session-alias-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let canonical = std::fs::canonicalize(&root).unwrap();
+        let alias = PathBuf::from("/var").join(canonical.strip_prefix("/private/var").unwrap());
+        let session = EphemeralRcloneSession {
+            operation_id: "operation".into(),
+            provider: "local".into(),
+            backend_type: "local".into(),
+            remote_name: "fixture".into(),
+            root: "/local-only".into(),
+            config_ini: "[fixture]\ntype = local\n".into(),
+            expires_at_unix: 0,
+            upload_concurrency: None,
+        };
+        let (config, guard) = write_guarded_ephemeral_session(&alias, &session).unwrap();
+        assert!(config.starts_with(&canonical));
+        assert!(config.is_file());
+        drop(guard);
+        assert!(!config.parent().unwrap().exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

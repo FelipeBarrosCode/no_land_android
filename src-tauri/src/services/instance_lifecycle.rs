@@ -6,7 +6,6 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::{
@@ -29,11 +28,24 @@ use super::{
 };
 
 /// In-memory tracking of lifecycle actions per instance to prevent overlap.
-static LIFECYCLE_ACTIONS: std::sync::OnceLock<RwLock<HashMap<u64, String>>> =
+static LIFECYCLE_ACTIONS: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, String>>> =
     std::sync::OnceLock::new();
 
-fn get_lifecycle_actions() -> &'static RwLock<HashMap<u64, String>> {
-    LIFECYCLE_ACTIONS.get_or_init(|| RwLock::new(HashMap::new()))
+fn get_lifecycle_actions() -> &'static std::sync::Mutex<HashMap<u64, String>> {
+    LIFECYCLE_ACTIONS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Helper preparation shares existing mobile lifecycle reservations. Its RAII
+/// guard releases on cancellation without holding a settings/map lock at await.
+pub struct InstanceActionGuard {
+    instance_id: u64,
+}
+impl Drop for InstanceActionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut actions) = get_lifecycle_actions().lock() {
+            actions.remove(&self.instance_id);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -345,7 +357,9 @@ impl InstanceLifecycleService {
 
     /// Acquire a lifecycle action lock for an instance.
     pub(crate) async fn acquire_lock(instance_id: u64, action: &str) -> AppResult<()> {
-        let mut actions = get_lifecycle_actions().write().await;
+        let mut actions = get_lifecycle_actions()
+            .lock()
+            .map_err(|_| AppError::State("Instance action lock is unavailable".into()))?;
         if let Some(running) = actions.get(&instance_id) {
             return Err(AppError::Provisioning(format!(
                 "Instance {} is already running action: {}. Please wait.",
@@ -357,8 +371,22 @@ impl InstanceLifecycleService {
     }
 
     pub(crate) async fn release_lock(instance_id: u64) {
-        let mut actions = get_lifecycle_actions().write().await;
-        actions.remove(&instance_id);
+        if let Ok(mut actions) = get_lifecycle_actions().lock() {
+            actions.remove(&instance_id);
+        }
+    }
+
+    pub(crate) async fn begin_action(
+        context: &AppContext,
+        instance_id: u64,
+        action: &str,
+    ) -> AppResult<InstanceActionGuard> {
+        let provisioning = context.orchestration_guard.lock().await;
+        if *provisioning {
+            return Err(AppError::Command("Provisioning is running; wait for its current stage before another machine mutation".into()));
+        }
+        Self::acquire_lock(instance_id, action).await?;
+        Ok(InstanceActionGuard { instance_id })
     }
 
     /// Pause a provisioned instance. Runs backup first if available.
@@ -739,39 +767,11 @@ impl InstanceLifecycleService {
         context: &AppContext,
         instance_id: u64,
     ) -> AppResult<Vec<crate::models::app_state::SharedStorageObjectEntry>> {
-        info!(
-            instance_id = instance_id,
-            "instance lifecycle list_shared_storage_objects start"
-        );
-        let api_key = {
-            let state = context.state.read().await;
-            state.credentials.vast_api_key.clone()
-        };
-
-        if api_key.trim().is_empty() {
-            return Err(AppError::InvalidInput(
-                "Vast API key is missing.".to_string(),
-            ));
-        }
-
-        let vast = VastApiClient::new(
-            context.http_client.clone(),
-            context.config.vast_base_url.clone(),
-            api_key,
-        );
-
-        let remote = build_remote_exec_for_instance(context, &vast, instance_id).await?;
-        let target_user = context.config.audio_target_user.clone();
-        let result =
-            SharedStorageManager::list_remote_objects(context, &remote, &target_user).await;
-        if let Ok(entries) = &result {
-            info!(
-                instance_id = instance_id,
-                count = entries.len(),
-                "instance lifecycle list_shared_storage_objects complete"
-            );
-        }
-        result
+        super::shared_storage::browse::list(
+            context,
+            instance_id,
+            super::shared_storage::browse::BrowseTarget::Cloud,
+        ).await
     }
 
     pub async fn sync_instance_from_shared_storage_selected(
@@ -824,25 +824,11 @@ impl InstanceLifecycleService {
         context: &AppContext,
         instance_id: u64,
     ) -> AppResult<Vec<crate::models::app_state::SharedStorageObjectEntry>> {
-        let api_key = {
-            let state = context.state.read().await;
-            state.credentials.vast_api_key.clone()
-        };
-        if api_key.trim().is_empty() {
-            return Err(AppError::InvalidInput(
-                "Vast API key is missing.".to_string(),
-            ));
-        }
-
-        let vast = VastApiClient::new(
-            context.http_client.clone(),
-            context.config.vast_base_url.clone(),
-            api_key,
-        );
-
-        let remote = build_remote_exec_for_instance(context, &vast, instance_id).await?;
-        let target_user = context.config.audio_target_user.clone();
-        SharedStorageManager::list_local_objects(context, &remote, &target_user).await
+        super::shared_storage::browse::list(
+            context,
+            instance_id,
+            super::shared_storage::browse::BrowseTarget::RemotePc,
+        ).await
     }
 
     pub async fn save_instance_to_shared_storage_selected(

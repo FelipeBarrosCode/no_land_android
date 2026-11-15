@@ -116,164 +116,6 @@ async fn cancel_and_wait(agent: &StateAgent, id: Uuid) {
 }
 
 #[tokio::test]
-async fn seal_replay_is_scoped_and_legacy_submissions_still_get_distinct_ids() {
-    let root = std::env::temp_dir().join(format!("noland-seal-replay-{}", Uuid::new_v4()));
-    let agent = Arc::new(StateAgent::boot(AgentConfig::isolated(root.clone())).unwrap());
-    let session = session(&root);
-    let master = MasterKey::generate();
-    let selection = json!({"app_id":"*", "mode":"complete_application"});
-    let id = Uuid::new_v4();
-    let params = persist_submission(&agent, "seal", &selection, &session, &master, id);
-    for state in ["QUEUED", "SEALED", "FAILED", "INTERRUPTED"] {
-        let mut operation = agent.db.get_operation(id).unwrap().unwrap();
-        operation.state = state.into();
-        agent.db.upsert_operation(&operation).unwrap();
-        let mut rotated = params.clone();
-        rotated["session"]["operation_id"] = json!("rotated-synthetic-session");
-        let replay = call(&agent, "StartSeal", rotated).await.unwrap();
-        assert_eq!(replay["operation_id"], id.to_string());
-        assert_eq!(replay["state"], state);
-        assert!(!agent.operations.is_running(id));
-    }
-    for change in ["mode", "key", "repository"] {
-        let mut changed = params.clone();
-        match change {
-            "mode" => changed["mode"] = json!("personal_state"),
-            "key" => changed["master_key_hex"] = json!(key_hex(&MasterKey::generate())),
-            _ => {
-                changed["session"]["root"] = json!("/elsewhere");
-                changed["client_storage_identity"]["root"] = json!("/elsewhere");
-            }
-        }
-        assert!(call(&agent, "StartSeal", changed).await.is_err());
-    }
-    let blocker = block_lane(&agent, OperationLane::Transfer).await;
-    let mut legacy = params;
-    legacy
-        .as_object_mut()
-        .unwrap()
-        .remove("client_operation_id");
-    let first = call(&agent, "StartSeal", legacy.clone()).await.unwrap();
-    let second = call(&agent, "StartSeal", legacy).await.unwrap();
-    assert_ne!(first["operation_id"], second["operation_id"]);
-    for response in [first, second] {
-        cancel_and_wait(
-            &agent,
-            Uuid::parse_str(response["operation_id"].as_str().unwrap()).unwrap(),
-        )
-        .await;
-    }
-    cancel_and_wait(&agent, blocker).await;
-    drop(agent);
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[tokio::test]
-async fn rejected_retry_overrides_do_not_reset_the_journal_or_identity() {
-    let root = std::env::temp_dir().join(format!("noland-retry-rejected-{}", Uuid::new_v4()));
-    let agent = Arc::new(StateAgent::boot(AgentConfig::isolated(root.clone())).unwrap());
-    let session = session(&root);
-    let master = MasterKey::generate();
-    let id = Uuid::new_v4();
-    let selection = json!({"app_id":"*", "mode":"complete_application", "performance_mode":"balanced", "regenerable_caches":"include"});
-    persist_submission(&agent, "backup", &selection, &session, &master, id);
-    let mut operation = agent.db.get_operation(id).unwrap().unwrap();
-    operation.state = "INTERRUPTED".into();
-    agent.db.upsert_operation(&operation).unwrap();
-    let mut entry = SyncJournalEntry::pending(
-        id,
-        "synthetic-pack",
-        ContentObjectKind::Pack,
-        SyncDirection::Upload,
-    );
-    entry.state = SyncJournalState::Failed;
-    agent.db.upsert_sync_journal_entry(&entry).unwrap();
-    let retry = json!({"operation_id":id, "session":session, "master_key_hex":key_hex(&master)});
-    let mut requests = Vec::new();
-    for (field, value) in [
-        ("mode", json!("personal_state")),
-        ("app_id", json!("another-app")),
-        ("regenerable_caches", json!("exclude")),
-        ("performance_mode", json!("fast")),
-        ("client_operation_id", json!(Uuid::new_v4())),
-        ("client_storage_identity", json!({"root":"somewhere-else"})),
-        ("_retry_operation_id", json!(id)),
-    ] {
-        let mut changed = retry.clone();
-        changed[field] = value;
-        requests.push(changed);
-    }
-    let mut wrong_key = retry.clone();
-    wrong_key["master_key_hex"] = json!(key_hex(&MasterKey::generate()));
-    requests.push(wrong_key);
-    let mut wrong_repository = retry;
-    wrong_repository["session"]["root"] = json!("/different-repository");
-    requests.push(wrong_repository);
-    for request in requests {
-        assert!(call(&agent, "RetryOperation", request).await.is_err());
-        assert_eq!(
-            agent.db.get_operation(id).unwrap().unwrap().detail_json,
-            operation.detail_json
-        );
-        assert_eq!(
-            agent
-                .db
-                .get_sync_journal_entry(id, "synthetic-pack")
-                .unwrap()
-                .unwrap()
-                .state,
-            SyncJournalState::Failed
-        );
-        assert!(!agent.operations.is_running(id));
-    }
-    drop(agent);
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[tokio::test]
-async fn seal_waits_for_transfer_lane_and_can_cancel_without_internal_side_effects() {
-    let root = std::env::temp_dir().join(format!("noland-seal-lane-{}", Uuid::new_v4()));
-    let agent = Arc::new(StateAgent::boot(AgentConfig::isolated(root.clone())).unwrap());
-    let blocker = block_lane(&agent, OperationLane::Transfer).await;
-    let master = MasterKey::generate();
-    let response = call(
-        &agent,
-        "StartSeal",
-        json!({
-            "client_operation_id": Uuid::new_v4(), "mode":"personal_state",
-            "session": session(&root), "master_key_hex":key_hex(&master)
-        }),
-    )
-    .await
-    .unwrap();
-    let id = Uuid::parse_str(response["operation_id"].as_str().unwrap()).unwrap();
-    for _ in 0..10 {
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(
-        agent.db.get_operation(id).unwrap().unwrap().state,
-        "REQUESTED"
-    );
-    assert_eq!(agent.db.recent_operations(100).unwrap().len(), 1);
-    assert!(agent
-        .operations
-        .running_snapshots()
-        .iter()
-        .find(|op| op.operation_id == id)
-        .unwrap()
-        .running_for_ms
-        .is_none());
-    cancel_and_wait(&agent, id).await;
-    assert_eq!(
-        agent.db.get_operation(id).unwrap().unwrap().state,
-        "CANCELLED"
-    );
-    cancel_and_wait(&agent, blocker).await;
-    drop(agent);
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[tokio::test]
 async fn restart_retry_disconnect_keeps_matching_identity_and_submission_binding() {
     for (kind, selection, lane) in [
         (
@@ -304,6 +146,7 @@ async fn restart_retry_disconnect_keeps_matching_identity_and_submission_binding
         assert!(!saved.detail_json.to_string().contains("synthetic-secret"));
         assert!(!saved.detail_json.to_string().contains(&key_hex(&master)));
         drop(agent);
+
         let agent = Arc::new(StateAgent::boot(AgentConfig::isolated(root.clone())).unwrap());
         agent.recover().unwrap();
         assert_eq!(
@@ -321,12 +164,15 @@ async fn restart_retry_disconnect_keeps_matching_identity_and_submission_binding
         let retried = call(
             &agent,
             "RetryOperation",
-            json!({"operation_id":id, "session":session, "master_key_hex":key_hex(&master)}),
+            json!({
+                "operation_id":id, "session":session, "master_key_hex":key_hex(&master),
+            }),
         )
         .await
         .unwrap();
         assert_eq!(retried["operation_id"], id.to_string());
         assert_eq!(retried["retried"], true);
+
         // Each call creates a fresh RPC handle, just as a disconnected client
         // reconnects. No worker can perform I/O while the test holds its lane.
         let recent = call(
@@ -391,6 +237,186 @@ async fn restart_retry_disconnect_keeps_matching_identity_and_submission_binding
         drop(agent);
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[tokio::test]
+async fn rejected_retry_overrides_do_not_reset_the_journal_or_identity() {
+    let root = std::env::temp_dir().join(format!("noland-retry-rejected-{}", Uuid::new_v4()));
+    let agent = Arc::new(StateAgent::boot(AgentConfig::isolated(root.clone())).unwrap());
+    let session = session(&root);
+    let master = MasterKey::generate();
+    let id = Uuid::new_v4();
+    let selection = json!({"app_id":"*", "mode":"complete_application", "performance_mode":"balanced", "regenerable_caches":"include"});
+    persist_submission(&agent, "backup", &selection, &session, &master, id);
+    let mut operation = agent.db.get_operation(id).unwrap().unwrap();
+    operation.state = "INTERRUPTED".into();
+    agent.db.upsert_operation(&operation).unwrap();
+    let mut entry = SyncJournalEntry::pending(
+        id,
+        "synthetic-pack",
+        ContentObjectKind::Pack,
+        SyncDirection::Upload,
+    );
+    entry.state = SyncJournalState::Failed;
+    agent.db.upsert_sync_journal_entry(&entry).unwrap();
+    let retry = json!({"operation_id":id, "session":session, "master_key_hex":key_hex(&master)});
+    let mut requests = Vec::new();
+    for (field, value) in [
+        ("mode", json!("personal_state")),
+        ("app_id", json!("another-app")),
+        ("regenerable_caches", json!("exclude")),
+        ("performance_mode", json!("fast")),
+        ("client_operation_id", json!(Uuid::new_v4())),
+        ("client_storage_identity", json!({"root":"somewhere-else"})),
+        ("_retry_operation_id", json!(id)),
+    ] {
+        let mut changed = retry.clone();
+        changed[field] = value;
+        requests.push(changed);
+    }
+    let mut wrong_key = retry.clone();
+    wrong_key["master_key_hex"] = json!(key_hex(&MasterKey::generate()));
+    requests.push(wrong_key);
+    let mut wrong_repository = retry;
+    wrong_repository["session"]["root"] = json!("/different-repository");
+    requests.push(wrong_repository);
+    for request in requests {
+        assert!(call(&agent, "RetryOperation", request).await.is_err());
+        assert_eq!(
+            agent.db.get_operation(id).unwrap().unwrap().detail_json,
+            operation.detail_json
+        );
+        assert_eq!(
+            agent
+                .db
+                .get_sync_journal_entry(id, "synthetic-pack")
+                .unwrap()
+                .unwrap()
+                .state,
+            SyncJournalState::Failed
+        );
+        assert!(!agent.operations.is_running(id));
+    }
+    drop(agent);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn retry_accepts_equivalent_aliases_but_persists_only_sanitized_identity() {
+    let mut stored = json!({"app_id":"*", "mode":"complete_application", "client_storage_identity": {
+        "provider":"sftp", "backend_type":"sftp", "remote_name":"store", "root":"/absolute"
+    }});
+    overlay_retry_secrets(
+        &mut stored,
+        &json!({"app_id":"_all", "mode":"complete", "session":{"config_ini":"synthetic-secret"}}),
+    )
+    .unwrap();
+    assert_eq!(stored["mode"], "complete_application");
+    assert_eq!(stored["app_id"], "*");
+    let mut wrong_root = stored["client_storage_identity"].clone();
+    wrong_root["root"] = json!("absolute");
+    assert!(
+        overlay_retry_secrets(&mut stored, &json!({"client_storage_identity":wrong_root})).is_err()
+    );
+    assert!(!sanitize_retry_params(&stored)
+        .to_string()
+        .contains("synthetic-secret"));
+}
+
+#[tokio::test]
+async fn seal_replay_is_scoped_and_legacy_submissions_still_get_distinct_ids() {
+    let root = std::env::temp_dir().join(format!("noland-seal-replay-{}", Uuid::new_v4()));
+    let agent = Arc::new(StateAgent::boot(AgentConfig::isolated(root.clone())).unwrap());
+    let session = session(&root);
+    let master = MasterKey::generate();
+    let selection = json!({"app_id":"*", "mode":"complete_application"});
+    let id = Uuid::new_v4();
+    let params = persist_submission(&agent, "seal", &selection, &session, &master, id);
+    for state in ["QUEUED", "SEALED", "FAILED", "INTERRUPTED"] {
+        let mut operation = agent.db.get_operation(id).unwrap().unwrap();
+        operation.state = state.into();
+        agent.db.upsert_operation(&operation).unwrap();
+        let mut rotated = params.clone();
+        rotated["session"]["operation_id"] = json!("rotated-synthetic-session");
+        let replay = call(&agent, "StartSeal", rotated).await.unwrap();
+        assert_eq!(replay["operation_id"], id.to_string());
+        assert_eq!(replay["state"], state);
+        assert!(!agent.operations.is_running(id));
+    }
+    for change in ["mode", "key", "repository"] {
+        let mut changed = params.clone();
+        match change {
+            "mode" => changed["mode"] = json!("personal_state"),
+            "key" => changed["master_key_hex"] = json!(key_hex(&MasterKey::generate())),
+            _ => {
+                changed["session"]["root"] = json!("/elsewhere");
+                changed["client_storage_identity"]["root"] = json!("/elsewhere");
+            }
+        }
+        assert!(call(&agent, "StartSeal", changed).await.is_err());
+    }
+    let blocker = block_lane(&agent, OperationLane::Transfer).await;
+    let mut legacy = params;
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("client_operation_id");
+    let first = call(&agent, "StartSeal", legacy.clone()).await.unwrap();
+    let second = call(&agent, "StartSeal", legacy).await.unwrap();
+    assert_ne!(first["operation_id"], second["operation_id"]);
+    for response in [first, second] {
+        cancel_and_wait(
+            &agent,
+            Uuid::parse_str(response["operation_id"].as_str().unwrap()).unwrap(),
+        )
+        .await;
+    }
+    cancel_and_wait(&agent, blocker).await;
+    drop(agent);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn seal_waits_for_transfer_lane_and_can_cancel_without_internal_side_effects() {
+    let root = std::env::temp_dir().join(format!("noland-seal-lane-{}", Uuid::new_v4()));
+    let agent = Arc::new(StateAgent::boot(AgentConfig::isolated(root.clone())).unwrap());
+    let blocker = block_lane(&agent, OperationLane::Transfer).await;
+    let master = MasterKey::generate();
+    let response = call(
+        &agent,
+        "StartSeal",
+        json!({
+            "client_operation_id": Uuid::new_v4(), "mode":"personal_state",
+            "session": session(&root), "master_key_hex":key_hex(&master)
+        }),
+    )
+    .await
+    .unwrap();
+    let id = Uuid::parse_str(response["operation_id"].as_str().unwrap()).unwrap();
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        agent.db.get_operation(id).unwrap().unwrap().state,
+        "REQUESTED"
+    );
+    assert_eq!(agent.db.recent_operations(100).unwrap().len(), 1);
+    assert!(agent
+        .operations
+        .running_snapshots()
+        .iter()
+        .find(|op| op.operation_id == id)
+        .unwrap()
+        .running_for_ms
+        .is_none());
+    cancel_and_wait(&agent, id).await;
+    assert_eq!(
+        agent.db.get_operation(id).unwrap().unwrap().state,
+        "CANCELLED"
+    );
+    cancel_and_wait(&agent, blocker).await;
+    drop(agent);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]

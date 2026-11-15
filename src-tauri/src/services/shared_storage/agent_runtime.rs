@@ -4,6 +4,8 @@ use sha2::{Digest, Sha256};
 use std::env;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use tokio::sync::RwLock;
 
 #[cfg(target_os = "android")]
 const EMBEDDED_STATE_AGENT_SOURCE: &[u8] =
@@ -15,6 +17,28 @@ use crate::services::remote_exec::RemoteExec;
 
 const AGENT_SOCKET: &str = "/run/noland/state-agent.sock";
 const REQUIRED_AGENT_API_VERSION: u64 = 22;
+
+type AgentEndpoint = (String, u16);
+type AgentAccessRegistry = Mutex<std::collections::HashMap<AgentEndpoint, Weak<RwLock<()>>>>;
+
+// All SSH identities for an endpoint use the same daemon/socket. RPCs may run
+// concurrently, but deployment must wait for their complete correlated replies.
+// Weak entries avoid retaining credentials or an unbounded history of instances.
+fn agent_access(remote: &RemoteExec) -> Arc<RwLock<()>> {
+    static ACCESS: OnceLock<AgentAccessRegistry> = OnceLock::new();
+    let mut entries = ACCESS
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    entries.retain(|_, entry| entry.strong_count() > 0);
+    let endpoint = (remote.ssh_host.to_ascii_lowercase(), remote.ssh_port);
+    if let Some(access) = entries.get(&endpoint).and_then(Weak::upgrade) {
+        return access;
+    }
+    let access = Arc::new(RwLock::new(()));
+    entries.insert(endpoint, Arc::downgrade(&access));
+    access
+}
 
 const TRUSTED_WORKSPACE_PROBE: &str = r#"set -eu
 link=/opt/noland/state-agent
@@ -33,7 +57,13 @@ test -z "$untrusted"
 "#;
 
 pub async fn ensure_state_agent(remote: &RemoteExec, target_user: &str) -> AppResult<()> {
-    let health = probe_agent(remote).await.ok();
+    let access = agent_access(remote);
+    let _deployment = access.write().await;
+    ensure_state_agent_exclusive(remote, target_user).await
+}
+
+async fn ensure_state_agent_exclusive(remote: &RemoteExec, target_user: &str) -> AppResult<()> {
+    let health = call_agent_raw_unlocked(remote, "GetHealth", serde_json::json!({})).await.ok();
     let active = deployment_has_active_work(remote, health.as_ref()).await?;
     let compatible = health.as_ref().and_then(|health| {
         health
@@ -139,7 +169,7 @@ async fn deployment_has_active_work(
     {
         return Ok(false);
     }
-    let recent = call_agent_raw(
+    let recent = call_agent_raw_unlocked(
         remote,
         "ListRecentOperations",
         serde_json::json!({"projection":"matching", "limit":1000}),
@@ -462,7 +492,7 @@ async fn wait_for_bootstrap(
     let mut last_connection_error = None;
 
     while tokio::time::Instant::now() < deadline {
-        if probe_agent(remote)
+        if call_agent_raw_unlocked(remote, "GetHealth", serde_json::json!({}))
             .await
             .ok()
             .is_some_and(|health| agent_api_is_compatible(&health))
@@ -534,7 +564,112 @@ pub async fn probe_agent(remote: &RemoteExec) -> AppResult<serde_json::Value> {
     call_agent_raw(remote, "GetHealth", serde_json::json!({})).await
 }
 
+/// Option browsing may use an already-running protocol-compatible generation,
+/// but must NEVER install tools, inspect source workspaces, deploy or restart.
+/// Execution continues to use ensure_state_agent's exact source/trust checks.
+pub(crate) async fn call_agent_browse(
+    remote: &RemoteExec,
+    method: &str,
+    params: serde_json::Value,
+) -> AppResult<serde_json::Value> {
+    if !matches!(method, "ListApps" | "ListCloudCatalog") {
+        return Err(AppError::InvalidInput(
+            "Only read-only option listing methods are permitted for browsing.".into(),
+        ));
+    }
+    let access = agent_access(remote);
+    let _request = access
+        .try_read()
+        .map_err(|_| super::browse::failure(super::browse::BrowseFailure::AgentUpdating))?;
+    let started = std::time::Instant::now();
+    let health = call_agent_raw_unlocked(remote, "GetHealth", serde_json::json!({}))
+        .await
+        .map_err(|_| super::browse::failure(super::browse::BrowseFailure::AgentUnavailable))?;
+    tracing::info!(
+        event = "shared_storage_browse_stage",
+        stage = "agent_health",
+        latency_ms = started.elapsed().as_millis() as u64,
+        rpc_requests = 1u64,
+        "Read-only storage agent probe completed"
+    );
+    require_browse_protocol(&health)?;
+    let started = std::time::Instant::now();
+    let result = call_agent_raw_unlocked(remote, method, params).await;
+    tracing::info!(
+        event = "shared_storage_browse_stage",
+        stage = "agent_read",
+        method,
+        latency_ms = started.elapsed().as_millis() as u64,
+        success = result.is_ok(),
+        rpc_requests = 1u64,
+        deployment_requests = 0u64,
+        "Read-only storage agent request completed"
+    );
+    match result {
+        Ok(value) => Ok(value),
+        Err(_) => {
+            // Probe only after a failed cloud read: healthy browsing adds no
+            // prerequisite round trip and never installs a missing executable.
+            if method == "ListCloudCatalog"
+                && matches!(browse_helper_available(remote).await, Ok(false))
+            {
+                return Err(super::browse::failure(
+                    super::browse::BrowseFailure::HelperMissing,
+                ));
+            }
+            Err(super::browse::failure(if method == "ListCloudCatalog" {
+                super::browse::BrowseFailure::ProviderUnavailable
+            } else {
+                super::browse::BrowseFailure::AgentUnavailable
+            }))
+        }
+    }
+}
+
+async fn browse_helper_available(remote: &RemoteExec) -> AppResult<bool> {
+    let script =
+        "import json,shutil; print(json.dumps({'available':shutil.which('rclone') is not None}))";
+    let output = run_rpc_transport(
+        rpc_ssh_command(remote, &format!("python3 -c {}", shell_escape(script)))?,
+        RpcInput(Vec::new()),
+        Duration::from_secs(15),
+    )
+    .await?;
+    parse_browse_helper_presence(&output)
+}
+
+fn parse_browse_helper_presence(output: &[u8]) -> AppResult<bool> {
+    let value: serde_json::Value = serde_json::from_slice(output)?;
+    value
+        .get("available")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| AppError::State("Invalid storage helper readiness response.".into()))
+}
+
+fn require_browse_protocol(health: &serde_json::Value) -> AppResult<()> {
+    if agent_api_is_compatible(health) {
+        Ok(())
+    } else {
+        Err(super::browse::failure(
+            super::browse::BrowseFailure::AgentIncompatible,
+        ))
+    }
+}
+
 pub async fn call_agent_raw(
+    remote: &RemoteExec,
+    method: &str,
+    params: serde_json::Value,
+) -> AppResult<serde_json::Value> {
+    let access = agent_access(remote);
+    let _request = access.read().await;
+    call_agent_raw_unlocked(remote, method, params).await
+}
+
+// Transport implementation for callers that already hold an access guard.
+// Only deployment's own probes bypass the public read wrapper, under its write
+// guard. User operations must always go through call_agent_raw.
+async fn call_agent_raw_unlocked(
     remote: &RemoteExec,
     method: &str,
     params: serde_json::Value,
@@ -579,6 +714,7 @@ fn rpc_deadlines(method: &str) -> (Duration, Duration) {
         | "ListRecentOperations"
         | "CancelOperation" => (8, 15),
         "StartBackup" | "StartRestore" | "StartSeal" | "RetryOperation" => (30, 45),
+        "ListApps" | "ListCloudCatalog" => (45, 60),
         _ => (300, 315),
     };
     (
@@ -756,6 +892,75 @@ fn parse_rpc_response(
 #[cfg(test)]
 mod tests {
     use super::{is_state_agent_source_dir, pack_state_agent_sources};
+
+    #[test]
+    fn mobile_browse_helper_probe_accepts_only_structured_booleans() {
+        assert!(!super::parse_browse_helper_presence(b"{\"available\":false}\n").unwrap());
+        assert!(super::parse_browse_helper_presence(b"{\"available\":true}\n").unwrap());
+        for invalid in [
+            b"rclone is installed".as_slice(),
+            b"{\"available\":\"true\"}",
+            b"{\"available\":1}",
+            b"{\"error\":\"provider output\"}",
+        ] {
+            assert!(super::parse_browse_helper_presence(invalid).is_err());
+        }
+    }
+
+    fn browse_remote_fixture() -> super::RemoteExec {
+        super::RemoteExec {
+            ssh_host: "browse.fixture.invalid".into(),
+            ssh_port: 2222,
+            ssh_user: "fixture".into(),
+            private_key_path: "/fixture/not-read".into(),
+            ssh_password: None,
+        }
+    }
+
+    #[test]
+    fn mobile_browse_accepts_protocol_compatible_sources_without_updating() {
+        assert!(super::require_browse_protocol(&serde_json::json!({
+            "agent_api_version": super::REQUIRED_AGENT_API_VERSION,
+            "source_fingerprint": "older-generation",
+            "active_operations": 1,
+        })).is_ok());
+        for health in [serde_json::json!({}), serde_json::json!({"agent_api_version": 1})] {
+            let error = super::require_browse_protocol(&health).unwrap_err().to_string();
+            assert!(error.contains("Explicitly update"));
+            assert!(error.contains("will not deploy or restart"));
+        }
+        let (socket, transport) = super::rpc_deadlines("ListCloudCatalog");
+        assert!(socket < transport);
+        assert!(transport <= std::time::Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn mobile_browse_rejects_mutations_and_busy_updates_without_connecting() {
+        let remote = browse_remote_fixture();
+        for method in ["StartBackup", "StartDeletion", "RetryOperation", "RefreshIndex"] {
+            let error = super::call_agent_browse(&remote, method, serde_json::json!({}))
+                .await.unwrap_err().to_string();
+            assert!(error.contains("Only read-only"));
+        }
+        let access = super::agent_access(&remote);
+        let _updating = access.write().await;
+        let error = super::call_agent_browse(&remote, "ListApps", serde_json::json!({}))
+            .await.unwrap_err().to_string();
+        assert!(error.contains("update is in progress"));
+    }
+
+    #[tokio::test]
+    async fn mobile_browse_and_updates_share_endpoint_guard_across_identities() {
+        let remote = browse_remote_fixture();
+        let mut other = remote.clone();
+        other.ssh_host = other.ssh_host.to_ascii_uppercase();
+        other.ssh_user = "other-identity".into();
+        let first = super::agent_access(&remote);
+        let second = super::agent_access(&other);
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        let _reading = first.read().await;
+        assert!(second.try_write().is_err());
+    }
     use flate2::read::GzDecoder;
     use std::{fs, path::PathBuf};
 

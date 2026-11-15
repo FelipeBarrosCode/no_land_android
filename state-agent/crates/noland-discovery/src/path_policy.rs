@@ -45,8 +45,8 @@ pub fn classify_observed_path(path: &Path) -> PathPolicyDecision {
     }
 
     let normalized = normalized_path(path);
-    // Machine-specific runtime images, caches and session credentials must never
-    // become portable application state. Per-app saves remain separate.
+    // Optional runtime images/caches/driver bindings and private X11 credentials
+    // are machine infrastructure, never application state for portable backups.
     if normalized.contains("/.local/state/noland-runtime/")
         || normalized.contains("/noland-runtime/images/")
         || normalized.contains("/noland-runtime/cache/")
